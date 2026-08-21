@@ -1,0 +1,18 @@
+# Interface web (upload/download de planilhas e relatórios)
+streamlit>=1.61
+
+# Processamento em memória rápido (substitui o Pandas nos scripts legados)
+polars>=1.43
+
+# Consultas SQL analíticas direto sobre os DataFrames do Polars
+duckdb>=1.5
+
+# Validação dos schemas de entrada e saída
+pydantic>=2.13
+
+# Leitura/escrita de .xlsx
+openpyxl>=3.1
+# Engine rápida (calamine) usada por padrão pelo pl.read_excel
+fastexcel>=0.20
+# Necessário para pl.DataFrame.write_excel (exportação final formatada)
+xlsxwriter>=3.2

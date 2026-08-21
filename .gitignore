@@ -1,0 +1,21 @@
+# Ambiente virtual / dependências
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Configuração local do Streamlit (segredos, tema local etc.)
+.streamlit/secrets.toml
+
+# Planilhas de entrada/saída processadas localmente. Ignoradas por padrão de
+# propósito: contêm dados pessoais de alunos (CPF, nome, data de nascimento)
+# e nunca devem ir parar num repositório Git.
+/dados/
+*.xlsx
+*.xls
+*.csv
+
+# Arquivos de IDE / SO
+.vscode/
+.idea/
+.DS_Store
