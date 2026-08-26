@@ -10,6 +10,8 @@ from src.schemas.etapa_de_ensino import RelatorioEtapaDeEnsino
 from src.schemas.exportacao import RelatorioExportacaoMEC
 from src.schemas.frequencia import RelatorioFrequencia
 from src.schemas.movimentacao import RelatorioMovimentacao
+from src.schemas.situacao_aluno import RelatorioSituacaoAluno
+from src.schemas.situacao_sigeduc import RelatorioSituacaoSigeduc
 
 __all__ = [
     "RelatorioDeduplicacao",
@@ -17,4 +19,6 @@ __all__ = [
     "RelatorioMovimentacao",
     "RelatorioFrequencia",
     "RelatorioExportacaoMEC",
+    "RelatorioSituacaoAluno",
+    "RelatorioSituacaoSigeduc",
 ]

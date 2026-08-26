@@ -33,7 +33,31 @@ from src.core.frequencia import (
     COLUNAS_PRESENTE_CANDIDATAS,
     calcular_frequencia,
 )
-from src.core.movimentacao import analisar_movimentacao
+from src.core._colunas import encontrar_coluna
+from src.core.movimentacao import (
+    COLUNAS_CENSO_SIGEDUC_CANDIDATAS,
+    COLUNAS_CPF_SGP_CANDIDATAS as COLUNAS_CPF_SGP_MOV_CANDIDATAS,
+    COLUNAS_CPF_SIGEDUC_CANDIDATAS as COLUNAS_CPF_SIGEDUC_MOV_CANDIDATAS,
+    COLUNAS_DATA_ENCERRAMENTO_SIGEDUC_CANDIDATAS,
+    COLUNAS_DATA_MATRICULA_SIGEDUC_CANDIDATAS,
+    COLUNAS_ENTIDADE_SGP_CANDIDATAS,
+    COLUNAS_ETAPA_SGP_CANDIDATAS,
+    COLUNAS_SITUACAO_SIGEDUC_CANDIDATAS,
+    reconciliar_sgp_sigeduc,
+)
+from src.core.situacao_aluno import (
+    COLUNAS_CENSO_CANDIDATAS,
+    COLUNAS_CO_ENTIDADE_CANDIDATAS,
+    COLUNAS_CPF_DESTINO_CANDIDATAS,
+    COLUNAS_CPF_SIGEDUC_CANDIDATAS as COLUNAS_CPF_SIGEDUC_SITUACAO_CANDIDATAS,
+    COLUNAS_DATA_ENCERRAMENTO_CANDIDATAS,
+    COLUNAS_DATA_FIM_CANDIDATAS,
+    COLUNAS_PERIODO_CANDIDATAS,
+    COLUNAS_SITUACAO_CANDIDATAS,
+    STATUS_APROVADO_PADRAO,
+    calcular_situacao_aluno,
+)
+from src.core.situacao_sigeduc import resumir_situacao_sigeduc
 from src.ui.downloads import botoes_download
 from src.ui.uploader import carregar_planilha
 from src.utils.higienizacao import limpar_cpf, padronizar_textos
@@ -55,6 +79,8 @@ MODULOS_CORE: dict[str, str | None] = {
     "🔀 C. Discrepâncias e Movimentação": "movimentacao",
     "📅 D. Cálculo de Frequência": "frequencia",
     "📤 E. Exportação Padrão MEC": "exportacao",
+    "✅ F. Situação de Matrícula e Aprovações": "situacao_aluno",
+    "📥 G. Situação de Matrícula (Somente SIGEDUC)": "situacao_sigeduc",
 }
 
 
@@ -284,115 +310,193 @@ def pagina_movimentacao() -> None:
     st.title("🔀 C. Discrepâncias e Movimentação")
     st.markdown(
         """
-Compara uma base **Antiga** com uma base **Nova** (as duas já passadas
-pelos módulos A e B) e classifica cada CPF:
+Reconcilia a base **SGP atual** (quem já está cadastrado) com uma ou mais
+planilhas brutas do **SIGEDUC** (a fonte de verdade) e devolve dois
+relatórios:
 
-- **`trans. escola`** — CO_ENTIDADE mudou.
-- **`trans. mod`** — mesma escola, mas o aluno cruzou entre EJA e Regular/Técnico
-  (progressão normal de série, ex. Regular 25→26, **não** conta como transferência).
-- **`avanco_terco_eja`** — aluno de EJA cujo terço/período avançou (1→2, 2→3, ou foi para o 4).
-- **`novo_cadastro`** — CPF que só existe na base Nova.
+- **Cadastro** — CPFs que aparecem no SIGEDUC mas ainda não existem no SGP,
+  já formatados no layout oficial de cadastro (24 colunas), prontos para
+  importar como aluno novo.
+- **Movimentação** — só os CPFs já cadastrados que tiveram
+  **`trans. escola`** (mudou de CO_ENTIDADE) ou **`trans. mod`** (mesma
+  escola, mas cruzou entre EJA e Regular/Técnico). Quem não teve nenhuma
+  mudança, ou teve a matrícula **cancelada** (mudança de modalidade sem
+  data de encerramento registrada, com histórico de cancelamento no
+  SIGEDUC), não entra nesta planilha — mas os dois casos continuam
+  contados nos avisos abaixo dela.
 
-Gera dois relatórios: **Movimentação** (quem já estava na base e mudou algo)
-e **Cadastro** (quem é novo). Implementado com um `LEFT JOIN` em SQL no
-DuckDB, em `src/core/movimentacao.py`.
+Implementado em `src/core/movimentacao.py`.
 """
     )
 
     col_up1, col_up2 = st.columns(2)
-    arquivo_antiga = col_up1.file_uploader(
-        "Base Antiga", type=["csv", "xlsx", "xls"], key="upload_mov_antiga"
+    arquivo_sgp = col_up1.file_uploader(
+        "Base SGP (atual)", type=["csv", "xlsx", "xls"], key="upload_mov_sgp"
     )
-    arquivo_nova = col_up2.file_uploader(
-        "Base Nova", type=["csv", "xlsx", "xls"], key="upload_mov_nova"
+    arquivos_sigeduc = col_up2.file_uploader(
+        "Planilha(s) do SIGEDUC",
+        type=["csv", "xlsx", "xls"],
+        accept_multiple_files=True,
+        key="upload_mov_sigeduc",
     )
-    if arquivo_antiga is None or arquivo_nova is None:
-        st.caption("Envie as duas planilhas (Antiga e Nova) para continuar.")
+    if arquivo_sgp is None or not arquivos_sigeduc:
+        st.caption("Envie a base do SGP e ao menos uma planilha do SIGEDUC para continuar.")
         return
 
     try:
-        df_antiga = carregar_planilha(arquivo_antiga)
-        df_nova = carregar_planilha(arquivo_nova)
+        df_sgp = carregar_planilha(arquivo_sgp)
+        partes_sigeduc = [
+            carregar_planilha(arquivo).with_columns(pl.lit(arquivo.name).alias("ORIGEM_ARQUIVO"))
+            for arquivo in arquivos_sigeduc
+        ]
+        df_sigeduc = pl.concat(partes_sigeduc, how="diagonal_relaxed")
     except Exception as exc:  # noqa: BLE001
         st.error(f"Não foi possível ler um dos arquivos: {exc}")
         return
 
     st.write(
-        f"Antiga: **{df_antiga.height} linhas** × **{df_antiga.width} colunas** · "
-        f"Nova: **{df_nova.height} linhas** × **{df_nova.width} colunas**."
+        f"SGP: **{df_sgp.height} linhas** × **{df_sgp.width} colunas** · "
+        f"SIGEDUC: **{df_sigeduc.height} linhas** de **{len(arquivos_sigeduc)} arquivo(s)** "
+        f"× **{df_sigeduc.width} colunas**."
     )
 
-    colunas_comuns = [c for c in df_nova.columns if c in df_antiga.columns]
-    if not colunas_comuns:
-        st.error("As duas planilhas não têm nenhuma coluna em comum — verifique os arquivos enviados.")
-        return
+    # Cada coluna é detectada de forma independente em cada base -- o
+    # índice pré-selecionado é só um "melhor palpite" tolerante a
+    # acento/espaço/caixa; `reconciliar_sgp_sigeduc` reconfere tudo (e
+    # avisa com uma mensagem clara se algo obrigatório não bater).
+    def _indice_padrao(df: pl.DataFrame, candidatos: tuple[str, ...]) -> int:
+        nome = encontrar_coluna(df, candidatos)
+        return df.columns.index(nome) if nome is not None else 0
 
-    def _padrao(candidatos: tuple[str, ...]) -> str:
-        return next((c for c in candidatos if c in colunas_comuns), colunas_comuns[0])
+    with st.expander("⚙️ Colunas detectadas (ajuste se necessário)"):
+        st.caption("Base SGP atual:")
+        col1, col2, col3 = st.columns(3)
+        coluna_cpf_sgp = col1.selectbox(
+            "Coluna de CPF",
+            options=df_sgp.columns,
+            index=_indice_padrao(df_sgp, COLUNAS_CPF_SGP_MOV_CANDIDATAS),
+            key="mov_cpf_sgp",
+        )
+        coluna_entidade_sgp = col2.selectbox(
+            "Coluna de CO_ENTIDADE",
+            options=df_sgp.columns,
+            index=_indice_padrao(df_sgp, COLUNAS_ENTIDADE_SGP_CANDIDATAS),
+            key="mov_entidade_sgp",
+        )
+        coluna_etapa_sgp = col3.selectbox(
+            "Coluna de Etapa de Ensino",
+            options=df_sgp.columns,
+            index=_indice_padrao(df_sgp, COLUNAS_ETAPA_SGP_CANDIDATAS),
+            key="mov_etapa_sgp",
+        )
 
-    col1, col2, col3 = st.columns(3)
-    coluna_cpf = col1.selectbox(
-        "Coluna de CPF", options=colunas_comuns, index=colunas_comuns.index(_padrao(("ESTUDANTE_CPF",)))
-    )
-    coluna_entidade = col2.selectbox(
-        "Coluna de CO_ENTIDADE", options=colunas_comuns, index=colunas_comuns.index(_padrao(("CO_ENTIDADE",)))
-    )
-    coluna_etapa = col3.selectbox(
-        "Coluna de Etapa de Ensino",
-        options=colunas_comuns,
-        index=colunas_comuns.index(_padrao(("ESTUDANTE_ETAPA_DE_ENSINO",))),
-    )
+        st.caption("SIGEDUC:")
+        col4, col5, col6, col7 = st.columns(4)
+        coluna_cpf_sigeduc = col4.selectbox(
+            "Coluna de CPF",
+            options=df_sigeduc.columns,
+            index=_indice_padrao(df_sigeduc, COLUNAS_CPF_SIGEDUC_MOV_CANDIDATAS),
+            key="mov_cpf_sigeduc",
+        )
+        coluna_censo_sigeduc = col5.selectbox(
+            "Coluna de CENSO",
+            options=df_sigeduc.columns,
+            index=_indice_padrao(df_sigeduc, COLUNAS_CENSO_SIGEDUC_CANDIDATAS),
+            key="mov_censo_sigeduc",
+        )
+        coluna_situacao_sigeduc = col6.selectbox(
+            "Coluna de Situação Matrícula",
+            options=df_sigeduc.columns,
+            index=_indice_padrao(df_sigeduc, COLUNAS_SITUACAO_SIGEDUC_CANDIDATAS),
+            key="mov_situacao_sigeduc",
+        )
+        coluna_data_encerramento_sigeduc = col7.selectbox(
+            "Coluna de Data Encerramento",
+            options=df_sigeduc.columns,
+            index=_indice_padrao(df_sigeduc, COLUNAS_DATA_ENCERRAMENTO_SIGEDUC_CANDIDATAS),
+            key="mov_data_encerramento_sigeduc",
+        )
 
-    comparar_por_grupo_amplo = st.checkbox(
-        "Ignorar progressão normal de série ao detectar 'trans. mod' (recomendado)",
-        value=True,
-        help="Com esta opção marcada, só conta como transferência de modalidade quando o "
-        "aluno cruza entre EJA e Regular/Técnico. Desmarcada, qualquer mudança no código "
-        "bruto de ESTUDANTE_ETAPA_DE_ENSINO conta — inclusive avanço normal de série.",
-    )
+        col8, col9, col10 = st.columns(3)
+        coluna_data_matricula_sigeduc = col8.selectbox(
+            "Coluna de Data Matrícula",
+            options=df_sigeduc.columns,
+            index=_indice_padrao(df_sigeduc, COLUNAS_DATA_MATRICULA_SIGEDUC_CANDIDATAS),
+            key="mov_data_matricula_sigeduc",
+        )
+        coluna_oferta_sigeduc = col9.selectbox(
+            "Coluna de Oferta de Ensino",
+            options=df_sigeduc.columns,
+            index=_indice_padrao(df_sigeduc, COLUNAS_OFERTA_CANDIDATAS),
+            key="mov_oferta_sigeduc",
+        )
+        coluna_serie_sigeduc = col10.selectbox(
+            "Coluna de Série",
+            options=df_sigeduc.columns,
+            index=_indice_padrao(df_sigeduc, COLUNAS_SERIE_CANDIDATAS),
+            key="mov_serie_sigeduc",
+        )
 
-    if not st.button("▶️ Comparar bases", type="primary"):
+    if not st.button("▶️ Reconciliar bases", type="primary"):
         return
 
     try:
-        df_mov, df_cad, relatorio = analisar_movimentacao(
-            df_antiga, df_nova, coluna_cpf, coluna_entidade, coluna_etapa,
-            comparar_por_grupo_amplo=comparar_por_grupo_amplo,
+        df_cadastro, df_movimentacao, relatorio = reconciliar_sgp_sigeduc(
+            df_sgp,
+            df_sigeduc,
+            coluna_cpf_sgp=coluna_cpf_sgp,
+            coluna_entidade_sgp=coluna_entidade_sgp,
+            coluna_etapa_sgp=coluna_etapa_sgp,
+            coluna_cpf_sigeduc=coluna_cpf_sigeduc,
+            coluna_censo_sigeduc=coluna_censo_sigeduc,
+            coluna_situacao_sigeduc=coluna_situacao_sigeduc,
+            coluna_data_encerramento_sigeduc=coluna_data_encerramento_sigeduc,
+            coluna_data_matricula_sigeduc=coluna_data_matricula_sigeduc,
+            coluna_oferta_sigeduc=coluna_oferta_sigeduc,
+            coluna_serie_sigeduc=coluna_serie_sigeduc,
         )
     except KeyError as exc:
         st.error(str(exc))
         return
 
-    st.success("Comparação concluída.")
+    st.success("Reconciliação concluída.")
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Antiga", relatorio.total_antiga)
-    m2.metric("Nova", relatorio.total_nova)
-    m3.metric("Novo cadastro", relatorio.total_novo_cadastro)
-    m4.metric("Trans. escola", relatorio.total_trans_escola)
-    m5.metric("Trans. mod", relatorio.total_trans_mod)
-    m6.metric("Avanço terço EJA", relatorio.total_avanco_terco_eja)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Base SGP", relatorio.total_sgp)
+    m2.metric("Cadastro (novos)", relatorio.total_cadastro)
+    m3.metric("Trans. escola", relatorio.total_trans_escola)
+    m4.metric("Trans. mod", relatorio.total_trans_mod)
 
-    if relatorio.total_somente_na_antiga:
+    if relatorio.total_sem_alteracao:
         st.caption(
-            f"ℹ️ {relatorio.total_somente_na_antiga} CPF(s) estavam na base Antiga e não "
-            "aparecem na Nova (não incluídos em nenhum dos relatórios abaixo)."
+            f"ℹ️ {relatorio.total_sem_alteracao} CPF(s) da base SGP não tiveram nenhuma mudança "
+            "e por isso não aparecem na planilha de Movimentação abaixo."
         )
-    if relatorio.coluna_terco is None:
+    if relatorio.total_cancelado:
         st.caption(
-            "ℹ️ Não encontrei uma coluna de terço/período (ex.: ESTUDANTE_ANO_PERIODO) em "
-            "uma das duas bases — avanço de terço EJA não foi verificado."
+            f"ℹ️ {relatorio.total_cancelado} CPF(s) tiveram a matrícula classificada como "
+            "'cancelado' — também não aparecem na planilha de Movimentação abaixo."
+        )
+    if relatorio.total_sgp_sem_correspondencia_sigeduc:
+        st.caption(
+            f"ℹ️ {relatorio.total_sgp_sem_correspondencia_sigeduc} CPF(s) da base SGP não têm "
+            "nenhuma matrícula ativa correspondente nas planilhas do SIGEDUC enviadas."
+        )
+    if relatorio.coluna_data_atualizacao_sigeduc is None:
+        st.caption(
+            "ℹ️ Não encontrei uma coluna de 'Data Atualização do Cadastro' no SIGEDUC -- "
+            "usei só a Data Encerramento como referência de data."
         )
 
-    aba_mov, aba_cad = st.tabs(
-        [f"🔀 Movimentação ({df_mov.height})", f"🆕 Cadastro ({df_cad.height})"]
+    aba_cad, aba_mov = st.tabs(
+        [f"📥 Cadastro ({df_cadastro.height})", f"🔀 Movimentação ({df_movimentacao.height})"]
     )
-    with aba_mov:
-        st.dataframe(df_mov.head(50), width="stretch")
-        botoes_download(df_mov, nome_base="movimentacao", key_prefix="mov")
     with aba_cad:
-        st.dataframe(df_cad.head(50), width="stretch")
-        botoes_download(df_cad, nome_base="cadastro", key_prefix="cad")
+        st.dataframe(df_cadastro.head(50), width="stretch")
+        botoes_download(df_cadastro, nome_base="cadastro", key_prefix="cad")
+    with aba_mov:
+        st.dataframe(df_movimentacao.head(50), width="stretch")
+        botoes_download(df_movimentacao, nome_base="movimentacao", key_prefix="mov")
 
 
 def pagina_frequencia() -> None:
@@ -588,6 +692,326 @@ confirmada no script legado `SCRIPT_PE_DE_MEIA`.
     botoes_download(df_final, nome_base="padrao_mec", key_prefix="export")
 
 
+def pagina_situacao_aluno() -> None:
+    st.title("✅ F. Situação de Matrícula e Aprovações")
+    st.markdown(
+        """
+Cruza uma base **bruta do SIGEDUC** (situação de matrícula/aprovação, um
+registro por período do aluno) com a base de **destino** (Pé de Meia/SGP a
+atualizar), pelo CPF, e preenche 5 colunas a partir da situação **mais
+recente** de cada aluno (critério: a `DATA ENCERRAMENTO` mais nova;
+sem nenhuma data válida, mantém o último registro da planilha):
+
+- **`DATA_FIM_OU_APROVACAO`** e **`DATA_CONCLUSAO_ENSINO_MEDIO`** — datas do registro mais recente.
+- **`PERIODO`** e **`SITUACAO_MATRICULA_RECENTE`** — período e situação do registro mais recente.
+- **`QTD_MODULOS_APROVADOS`** — quantos registros *daquele CPF* (não só o mais recente) têm situação de aprovação.
+
+Um CPF do destino que não aparece no SIGEDUC enviado mantém os valores que
+já tinha (menos `QTD_MODULOS_APROVADOS`, que sempre reflete só a rodada
+atual — nenhuma linha do destino é descartada por falta de
+correspondência). Duas checagens opcionais abaixo replicam as duas
+variações mais recentes do script legado `GERANDO_APROVADOS`. Implementado
+com Polars + DuckDB em `src/core/situacao_aluno.py`.
+"""
+    )
+
+    col_up1, col_up2 = st.columns(2)
+    arquivo_sigeduc = col_up1.file_uploader(
+        "Base SIGEDUC (situação/aprovação bruta)", type=["csv", "xlsx", "xls"], key="upload_sit_sigeduc"
+    )
+    arquivo_destino = col_up2.file_uploader(
+        "Base de destino (Pé de Meia/SGP a atualizar)", type=["csv", "xlsx", "xls"], key="upload_sit_destino"
+    )
+    if arquivo_sigeduc is None or arquivo_destino is None:
+        st.caption("Envie as duas planilhas (SIGEDUC e destino) para continuar.")
+        return
+
+    try:
+        df_sigeduc = carregar_planilha(arquivo_sigeduc)
+        df_destino = carregar_planilha(arquivo_destino)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler um dos arquivos: {exc}")
+        return
+
+    st.write(
+        f"SIGEDUC: **{df_sigeduc.height} linhas** × **{df_sigeduc.width} colunas** · "
+        f"Destino: **{df_destino.height} linhas** × **{df_destino.width} colunas**."
+    )
+
+    def _padrao(colunas: list[str], candidatos: tuple[str, ...]) -> str:
+        return next((c for c in candidatos if c in colunas), colunas[0])
+
+    col1, col2 = st.columns(2)
+    coluna_cpf_sigeduc = col1.selectbox(
+        "Coluna de CPF (base SIGEDUC)",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_CPF_SIGEDUC_SITUACAO_CANDIDATAS)),
+    )
+    coluna_cpf_destino = col2.selectbox(
+        "Coluna de CPF (base destino)",
+        options=df_destino.columns,
+        index=df_destino.columns.index(_padrao(df_destino.columns, COLUNAS_CPF_DESTINO_CANDIDATAS)),
+    )
+
+    col3, col4, col5 = st.columns(3)
+    coluna_data_fim = col3.selectbox(
+        "Coluna de Data Fim (SIGEDUC)",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_DATA_FIM_CANDIDATAS)),
+    )
+    coluna_data_encerramento = col4.selectbox(
+        "Coluna de Data Encerramento (SIGEDUC)",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_DATA_ENCERRAMENTO_CANDIDATAS)),
+        help="Além de virar 'DATA_CONCLUSAO_ENSINO_MEDIO', esta coluna decide qual "
+        "registro é a 'situação mais recente' de cada CPF.",
+    )
+    coluna_periodo = col5.selectbox(
+        "Coluna de Período (SIGEDUC)",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_PERIODO_CANDIDATAS)),
+    )
+
+    col6, col7 = st.columns(2)
+    coluna_situacao = col6.selectbox(
+        "Coluna de Situação Matrícula (SIGEDUC)",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_SITUACAO_CANDIDATAS)),
+    )
+    status_aprovado = col7.text_input(
+        "Texto que identifica 'módulo aprovado' (não diferencia maiúsculas/minúsculas)",
+        value=STATUS_APROVADO_PADRAO,
+        help="Conta, para cada CPF, quantos registros do SIGEDUC têm a situação "
+        "contendo este texto — não só a situação mais recente.",
+    )
+
+    st.divider()
+    st.write("**Checagens opcionais** (replicam as duas variações mais recentes do script legado):")
+
+    col_op1, col_op2 = st.columns(2)
+    aplicar_transferencia_externa = col_op1.checkbox(
+        "Reclassificar 'Transferência Externa'",
+        value=True,
+        help="Um CPF cuja situação mais recente é 'TRANSFERIDO' e que nunca teve "
+        "nenhuma outra situação no histórico do SIGEDUC enviado é reclassificado "
+        "para 'TRANSFERÊNCIA EXTERNA' — ele nunca chegou a se matricular de fato "
+        "aqui, só existe por já ter vindo transferido de outra rede/escola.",
+    )
+    aplicar_checagem_censo = col_op2.checkbox(
+        "Checar divergência de Censo × CO_ENTIDADE",
+        value=False,
+        help="Compara o código de Censo/INEP do SIGEDUC com o CO_ENTIDADE do destino "
+        "para cada CPF encontrado; quem divergir é removido da base principal e "
+        "devolvido à parte, para conferência manual.",
+    )
+
+    coluna_censo: str | None = None
+    coluna_co_entidade: str | None = None
+    if aplicar_checagem_censo:
+        col_censo1, col_censo2 = st.columns(2)
+        coluna_censo = col_censo1.selectbox(
+            "Coluna de Censo/INEP (SIGEDUC)",
+            options=df_sigeduc.columns,
+            index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_CENSO_CANDIDATAS)),
+        )
+        coluna_co_entidade = col_censo2.selectbox(
+            "Coluna de CO_ENTIDADE (destino)",
+            options=df_destino.columns,
+            index=df_destino.columns.index(_padrao(df_destino.columns, COLUNAS_CO_ENTIDADE_CANDIDATAS)),
+        )
+
+    if not st.button("▶️ Calcular Situação do Aluno", type="primary"):
+        return
+
+    try:
+        df_atualizado, df_divergentes, relatorio = calcular_situacao_aluno(
+            df_sigeduc,
+            df_destino,
+            coluna_cpf_sigeduc=coluna_cpf_sigeduc,
+            coluna_cpf_destino=coluna_cpf_destino,
+            coluna_data_fim=coluna_data_fim,
+            coluna_data_encerramento=coluna_data_encerramento,
+            coluna_periodo=coluna_periodo,
+            coluna_situacao=coluna_situacao,
+            status_aprovado=status_aprovado,
+            aplicar_transferencia_externa=aplicar_transferencia_externa,
+            aplicar_checagem_censo=aplicar_checagem_censo,
+            coluna_censo=coluna_censo,
+            coluna_co_entidade=coluna_co_entidade,
+        )
+    except KeyError as exc:
+        st.error(str(exc))
+        return
+
+    st.success("Situação do aluno atualizada.")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("SIGEDUC", relatorio.total_sigeduc)
+    m2.metric("Destino", relatorio.total_destino)
+    m3.metric("Com correspondência", relatorio.total_com_correspondencia_sigeduc)
+    m4.metric("Sem correspondência", relatorio.total_sem_correspondencia_sigeduc)
+
+    m5, m6, m7 = st.columns(3)
+    m5.metric("Com aprovação", relatorio.total_com_aprovacao)
+    m6.metric("Transferência Externa", relatorio.total_reclassificados_transferencia_externa)
+    m7.metric("Divergentes (Censo)", relatorio.total_divergentes_censo)
+
+    if relatorio.total_sem_correspondencia_sigeduc:
+        st.caption(
+            f"ℹ️ {relatorio.total_sem_correspondencia_sigeduc} CPF(s) do destino não foram "
+            "encontrados na base SIGEDUC enviada — mantiveram os valores que já tinham "
+            "(exceto QTD_MODULOS_APROVADOS, que ficou 0)."
+        )
+    if relatorio.total_divergentes_censo:
+        st.warning(
+            f"⚠️ {relatorio.total_divergentes_censo} aluno(s) tiveram Censo (SIGEDUC) "
+            "diferente do CO_ENTIDADE (destino) e foram removidos da base principal — "
+            "confira a aba 'Divergentes' antes de decidir o que fazer com eles."
+        )
+
+    if aplicar_checagem_censo:
+        aba_atualizada, aba_divergentes = st.tabs(
+            [f"📋 Atualizado ({df_atualizado.height})", f"⚠️ Divergentes Censo ({df_divergentes.height})"]
+        )
+        with aba_atualizada:
+            st.dataframe(df_atualizado.head(50), width="stretch")
+            botoes_download(df_atualizado, nome_base="situacao_aluno_atualizado", key_prefix="sit_atual")
+        with aba_divergentes:
+            st.caption("Alunos removidos da base principal por divergência de Censo × CO_ENTIDADE.")
+            st.dataframe(df_divergentes.head(50), width="stretch")
+            botoes_download(df_divergentes, nome_base="situacao_aluno_divergentes_censo", key_prefix="sit_div")
+    else:
+        st.write("**Pré-visualização do resultado:**")
+        st.dataframe(df_atualizado.head(50), width="stretch")
+        botoes_download(df_atualizado, nome_base="situacao_aluno_atualizado", key_prefix="sit_atual")
+
+
+def pagina_situacao_sigeduc() -> None:
+    st.title("📥 G. Situação de Matrícula (Somente SIGEDUC)")
+    st.markdown(
+        """
+Variação do **Módulo F** para quando você não tem (ou não quer usar) uma
+base de destino para cruzar: envie só a planilha **bruta do SIGEDUC** e
+recebe, para cada CPF encontrado, a **linha inteira** do registro mais
+recente (todas as colunas originais da planilha — nome, escola,
+nascimento, o que ela tiver) mais a coluna `QTD_MODULOS_APROVADOS`.
+
+"Mais recente" usa o mesmo critério do Módulo F: prioriza a `DATA
+ENCERRAMENTO` mais nova; sem nenhuma data válida em nenhum registro do
+CPF, mantém o último registro na ordem original da planilha.
+
+Diferenças em relação ao Módulo F: o resultado só traz CPFs que **existem**
+no SIGEDUC enviado (não há uma base de destino para preservar quem não
+tiver correspondência), e não tem a checagem de divergência de Censo ×
+CO_ENTIDADE (que precisa de uma base de destino para comparar — use o
+Módulo F se precisar dela). A reclassificação de **Transferência Externa**
+continua disponível, porque não depende de destino nenhum. Implementado em
+`src/core/situacao_sigeduc.py`, reaproveitando as mesmas funções do
+Módulo F.
+"""
+    )
+
+    arquivo_sigeduc = st.file_uploader(
+        "Base SIGEDUC (situação/aprovação bruta)", type=["csv", "xlsx", "xls"], key="upload_sitsig_sigeduc"
+    )
+    if arquivo_sigeduc is None:
+        st.caption("Nenhum arquivo enviado ainda.")
+        return
+
+    try:
+        df_sigeduc = carregar_planilha(arquivo_sigeduc)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler o arquivo: {exc}")
+        return
+
+    st.write(f"Arquivo lido: **{df_sigeduc.height} linhas** × **{df_sigeduc.width} colunas**.")
+
+    def _padrao(colunas: list[str], candidatos: tuple[str, ...]) -> str:
+        return next((c for c in candidatos if c in colunas), colunas[0])
+
+    col1, col2, col3 = st.columns(3)
+    coluna_cpf = col1.selectbox(
+        "Coluna de CPF (base SIGEDUC)",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_CPF_SIGEDUC_SITUACAO_CANDIDATAS)),
+    )
+    coluna_data_fim = col2.selectbox(
+        "Coluna de Data Fim",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_DATA_FIM_CANDIDATAS)),
+    )
+    coluna_data_encerramento = col3.selectbox(
+        "Coluna de Data Encerramento",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_DATA_ENCERRAMENTO_CANDIDATAS)),
+        help="Decide qual registro é a 'situação mais recente' de cada CPF.",
+    )
+
+    col4, col5 = st.columns(2)
+    coluna_periodo = col4.selectbox(
+        "Coluna de Período",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_PERIODO_CANDIDATAS)),
+    )
+    coluna_situacao = col5.selectbox(
+        "Coluna de Situação Matrícula",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_SITUACAO_CANDIDATAS)),
+    )
+
+    status_aprovado = st.text_input(
+        "Texto que identifica 'módulo aprovado' (não diferencia maiúsculas/minúsculas)",
+        value=STATUS_APROVADO_PADRAO,
+        help="Conta, para cada CPF, quantos registros do SIGEDUC têm a situação "
+        "contendo este texto — não só a situação mais recente.",
+    )
+    aplicar_transferencia_externa = st.checkbox(
+        "Reclassificar 'Transferência Externa'",
+        value=True,
+        help="Um CPF cuja situação mais recente é 'TRANSFERIDO' e que nunca teve "
+        "nenhuma outra situação no histórico do SIGEDUC enviado é reclassificado "
+        "para 'TRANSFERÊNCIA EXTERNA' — ele nunca chegou a se matricular de fato "
+        "aqui, só existe por já ter vindo transferido de outra rede/escola.",
+    )
+
+    if not st.button("▶️ Gerar Situação do SIGEDUC", type="primary"):
+        return
+
+    try:
+        df_resultado, relatorio = resumir_situacao_sigeduc(
+            df_sigeduc,
+            coluna_cpf=coluna_cpf,
+            coluna_data_fim=coluna_data_fim,
+            coluna_data_encerramento=coluna_data_encerramento,
+            coluna_periodo=coluna_periodo,
+            coluna_situacao=coluna_situacao,
+            status_aprovado=status_aprovado,
+            aplicar_transferencia_externa=aplicar_transferencia_externa,
+        )
+    except KeyError as exc:
+        st.error(str(exc))
+        return
+
+    st.success("Situação gerada a partir do SIGEDUC.")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("SIGEDUC (linhas)", relatorio.total_sigeduc)
+    m2.metric("Com CPF válido", relatorio.total_sigeduc_cpf_valido)
+    m3.metric("CPFs únicos (resultado)", relatorio.total_cpfs_unicos)
+    m4.metric("Com aprovação", relatorio.total_com_aprovacao)
+
+    if relatorio.total_reclassificados_transferencia_externa:
+        st.caption(
+            f"ℹ️ {relatorio.total_reclassificados_transferencia_externa} CPF(s) "
+            "reclassificado(s) para 'TRANSFERÊNCIA EXTERNA'."
+        )
+
+    st.write("**Pré-visualização do resultado (1 linha por CPF, a mais recente):**")
+    st.dataframe(df_resultado.head(50), width="stretch")
+
+    botoes_download(df_resultado, nome_base="situacao_sigeduc", key_prefix="sitsig")
+
+
 def pagina_em_breve(titulo: str) -> None:
     st.title(titulo)
     st.info(
@@ -604,6 +1028,8 @@ PAGINAS_IMPLEMENTADAS = {
     "movimentacao": pagina_movimentacao,
     "frequencia": pagina_frequencia,
     "exportacao": pagina_exportacao,
+    "situacao_aluno": pagina_situacao_aluno,
+    "situacao_sigeduc": pagina_situacao_sigeduc,
 }
 
 with st.sidebar:
@@ -612,7 +1038,7 @@ with st.sidebar:
     pagina = st.radio("Módulo", list(MODULOS_CORE.keys()), index=0)
     st.divider()
     st.caption(
-        "Os 5 módulos do briefing (A-E) estão implementados em `src/core`. "
+        "Os 7 módulos do briefing (A-G) estão implementados em `src/core`. "
         "Cada um valida as colunas que recebe e mostra um erro claro se "
         "alguma estiver faltando."
     )

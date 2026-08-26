@@ -16,8 +16,14 @@ from collections.abc import Sequence
 import polars as pl
 
 
-def _normalizar_nome_coluna(nome: str) -> str:
-    """Maiúsculas, sem acento, sem espaço/underscore/pontuação -- só letras e números."""
+def normalizar_nome_coluna(nome: str) -> str:
+    """Maiúsculas, sem acento, sem espaço/underscore/pontuação -- só letras e números.
+
+    Pública de propósito: além de ser usada internamente por
+    `encontrar_coluna`, as telas do Streamlit que precisam comparar colunas
+    de duas planilhas diferentes (ex.: Módulo C) reaproveitam esta mesma
+    normalização -- ver `colunas_comuns_normalizadas` abaixo.
+    """
     sem_acento = unicodedata.normalize("NFKD", nome).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^A-Z0-9]", "", sem_acento.upper())
 
@@ -33,12 +39,39 @@ def encontrar_coluna(df: pl.DataFrame, candidatos: Sequence[str]) -> str | None:
 
     Devolve `None` se nenhum candidato for encontrado.
     """
-    colunas_normalizadas = {_normalizar_nome_coluna(c): c for c in df.columns}
+    colunas_normalizadas = {normalizar_nome_coluna(c): c for c in df.columns}
     for candidato in candidatos:
-        nome_real = colunas_normalizadas.get(_normalizar_nome_coluna(candidato))
+        nome_real = colunas_normalizadas.get(normalizar_nome_coluna(candidato))
         if nome_real is not None:
             return nome_real
     return None
+
+
+def colunas_comuns_normalizadas(referencia: pl.DataFrame, outra: pl.DataFrame) -> list[str]:
+    """Devolve as colunas de `referencia` que também existem em `outra`,
+    comparando de forma tolerante a acento/espaço/caixa (a mesma tolerância
+    de `encontrar_coluna`) em vez de comparação exata de string.
+
+    Usado nas telas do Streamlit que comparam duas planilhas (ex.: Módulo C
+    -- Antiga x Nova) para montar a lista de colunas selecionáveis: sem essa
+    tolerância, duas bases com a mesma coluna escrita de forma um pouco
+    diferente (`'CO_ENTIDADE'` vs `'CO ENTIDADE'`, ou com um espaço a mais)
+    apareceriam como "sem nada em comum" nessa coluna, mesmo sendo a mesma
+    informação -- e sobraria só alguma coluna calculada com nome fixo
+    (ex.: `ESTUDANTE_ETAPA_DE_ENSINO`) como opção no menu.
+
+    O nome devolvido é sempre o de `referencia` (a ordem também segue
+    `referencia.columns`); cada coluna aparece no máximo uma vez.
+    """
+    normalizadas_outra = {normalizar_nome_coluna(c) for c in outra.columns}
+    vistas: set[str] = set()
+    resultado: list[str] = []
+    for coluna in referencia.columns:
+        chave = normalizar_nome_coluna(coluna)
+        if chave in normalizadas_outra and chave not in vistas:
+            vistas.add(chave)
+            resultado.append(coluna)
+    return resultado
 
 
 def exigir_coluna(df: pl.DataFrame, candidatos: Sequence[str], descricao: str) -> str:
