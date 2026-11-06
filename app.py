@@ -15,11 +15,21 @@ Execução local:
 
 from __future__ import annotations
 
+import datetime
+
 import duckdb
 import polars as pl
 import streamlit as st
 
-from src.core.deduplicacao import COLUNAS_DATA_CANDIDATAS, deduplicar_matricula_mais_recente
+from src.core.deduplicacao import (
+    COLUNAS_ALOCACAO_CANDIDATAS,
+    COLUNAS_ATUALIZACAO_CANDIDATAS,
+    COLUNAS_DATA_CANDIDATAS,
+    COLUNAS_ENCERRAMENTO_CANDIDATAS,
+    deduplicar_matricula_mais_recente,
+)
+from src.core.comparacao_situacao import comparar_situacoes
+from src.core.comparacao_serie import comparar_series
 from src.core.etapa_de_ensino import (
     COLUNAS_OFERTA_CANDIDATAS,
     COLUNAS_SERIE_CANDIDATAS,
@@ -27,17 +37,30 @@ from src.core.etapa_de_ensino import (
 )
 from src.core.exportacao import ORDEM_PADRAO_MEC, exportar_padrao_mec
 from src.core.frequencia import (
+    COLUNA_FALTAS_ALUNO_HORA,
+    COLUNA_HORA_AULA_DADA,
+    COLUNAS_ANO_PERIODO_TERCO_CANDIDATAS as COLUNAS_ANO_PERIODO_TERCO_FREQ_CANDIDATAS,
+    COLUNAS_CPF_ID_SGP_CANDIDATAS,
     COLUNAS_CPF_SGP_CANDIDATAS,
     COLUNAS_CPF_SIGEDUC_CANDIDATAS,
+    COLUNAS_CPF_TERCO_CANDIDATAS as COLUNAS_CPF_TERCO_FREQ_CANDIDATAS,
+    COLUNAS_ENTIDADE_SIGEDUC_CANDIDATAS,
+    COLUNAS_ID_SGP_MATRICULA_CANDIDATAS,
+    COLUNAS_MATRICULA_SGP_CANDIDATAS,
+    COLUNAS_MATRICULA_SIGEDUC_CANDIDATAS,
+    COLUNAS_MES_REFERENCIA_CANDIDATAS,
     COLUNAS_OFERTADA_CANDIDATAS,
     COLUNAS_PRESENTE_CANDIDATAS,
     calcular_frequencia,
+    gerar_frequencia_do_sigeduc,
 )
 from src.core._colunas import encontrar_coluna
 from src.core.movimentacao import (
+    COLUNAS_ANO_PERIODO_TERCO_CANDIDATAS,
     COLUNAS_CENSO_SIGEDUC_CANDIDATAS,
     COLUNAS_CPF_SGP_CANDIDATAS as COLUNAS_CPF_SGP_MOV_CANDIDATAS,
     COLUNAS_CPF_SIGEDUC_CANDIDATAS as COLUNAS_CPF_SIGEDUC_MOV_CANDIDATAS,
+    COLUNAS_CPF_TERCO_CANDIDATAS,
     COLUNAS_DATA_ENCERRAMENTO_SIGEDUC_CANDIDATAS,
     COLUNAS_DATA_MATRICULA_SIGEDUC_CANDIDATAS,
     COLUNAS_ENTIDADE_SGP_CANDIDATAS,
@@ -58,7 +81,7 @@ from src.core.situacao_aluno import (
     calcular_situacao_aluno,
 )
 from src.core.situacao_sigeduc import resumir_situacao_sigeduc
-from src.ui.downloads import botoes_download
+from src.ui.downloads import botoes_download, para_bytes_excel
 from src.ui.uploader import carregar_planilha
 from src.utils.higienizacao import limpar_cpf, padronizar_textos
 
@@ -81,6 +104,8 @@ MODULOS_CORE: dict[str, str | None] = {
     "📤 E. Exportação Padrão MEC": "exportacao",
     "✅ F. Situação de Matrícula e Aprovações": "situacao_aluno",
     "📥 G. Situação de Matrícula (Somente SIGEDUC)": "situacao_sigeduc",
+    "🔎 H. Comparar Situação SIGEDUC × SGP": "comparacao_situacao",
+    "📚 I. Comparar Série/Ano SIGEDUC × SGP": "comparacao_serie",
 }
 
 
@@ -154,11 +179,12 @@ def pagina_dedup() -> None:
     st.title("🔁 A. Deduplicação e Matrícula Mais Recente")
     st.markdown(
         """
-Recebe uma base do SIGEDUC e mantém **apenas um registro por CPF**: o da
-matrícula mais recente. Por baixo dos panos: limpa o CPF, normaliza a
-coluna de data escolhida e ordena por CPF + data, mantendo sempre o
-registro mais novo (`keep='last'`) — exatamente a regra pedida no
-briefing, implementada em `src/core/deduplicacao.py`.
+Recebe uma base do SIGEDUC e mantém **apenas um registro por CPF**. Para
+cada linha, usa a **data de encerramento** ou, quando ela estiver vazia,
+a **data de atualização do cadastro**. Vence a linha cuja data de referência
+é mais recente. Em empate, prefere o registro com encerramento. Sem essas
+duas datas, prefere um registro com alocação; depois compara a data de
+matrícula e, em empate, a data de alocação.
 """
     )
 
@@ -175,29 +201,62 @@ briefing, implementada em `src/core/deduplicacao.py`.
 
     st.write(f"Arquivo lido: **{df.height} linhas** × **{df.width} colunas**.")
 
-    col_cpf_padrao = "ESTUDANTE_CPF" if "ESTUDANTE_CPF" in df.columns else df.columns[0]
-    col_data_padrao = next((c for c in COLUNAS_DATA_CANDIDATAS if c in df.columns), df.columns[0])
+    def indice_sugerido(candidatas: tuple[str, ...]) -> int | None:
+        encontrada = encontrar_coluna(df, candidatas)
+        return df.columns.index(encontrada) if encontrada else None
 
     col1, col2 = st.columns(2)
     coluna_cpf = col1.selectbox(
         "Coluna de CPF do estudante",
         options=df.columns,
-        index=df.columns.index(col_cpf_padrao),
+        index=indice_sugerido(("ESTUDANTE_CPF", "CPF", "NU_CPF")),
+        placeholder="Selecione a coluna de CPF",
     )
     coluna_data = col2.selectbox(
-        "Coluna de data (define a matrícula 'mais recente')",
+        "Coluna de data de matrícula",
         options=df.columns,
-        index=df.columns.index(col_data_padrao),
-        help="O briefing cita 'DATA_INICIO_MATRICULA' ou 'DATA ENCERRAMENTO'; "
-        "escolha a que existir na sua planilha.",
+        index=indice_sugerido(COLUNAS_DATA_CANDIDATAS),
+        placeholder="Selecione a data de matrícula",
+    )
+    col3, col4 = st.columns(2)
+    indice_encerramento = indice_sugerido(COLUNAS_ENCERRAMENTO_CANDIDATAS)
+    indice_atualizacao = indice_sugerido(COLUNAS_ATUALIZACAO_CANDIDATAS)
+    coluna_encerramento = col3.selectbox(
+        "Coluna de data de encerramento (se existir)",
+        options=["", *df.columns],
+        index=indice_encerramento + 1 if indice_encerramento is not None else 0,
+        format_func=lambda valor: "Não existe nesta planilha" if valor == "" else valor,
+    )
+    coluna_atualizacao = col4.selectbox(
+        "Coluna de data de atualização do cadastro (se existir)",
+        options=["", *df.columns],
+        index=indice_atualizacao + 1 if indice_atualizacao is not None else 0,
+        format_func=lambda valor: "Não existe nesta planilha" if valor == "" else valor,
+    )
+    coluna_alocacao = st.selectbox(
+        "Coluna de data de alocação",
+        options=df.columns,
+        index=indice_sugerido(COLUNAS_ALOCACAO_CANDIDATAS),
+        placeholder="Selecione a data de alocação",
     )
 
     if not st.button("▶️ Deduplicar", type="primary"):
         return
+    if None in (coluna_cpf, coluna_data, coluna_alocacao):
+        st.error("Selecione as colunas de CPF, matrícula e alocação.")
+        return
+    if not coluna_encerramento and not coluna_atualizacao:
+        st.error("Selecione a data de encerramento ou a data de atualização do cadastro.")
+        return
 
     try:
-        df_final, relatorio = deduplicar_matricula_mais_recente(df, coluna_cpf, coluna_data)
-    except KeyError as exc:
+        df_final, relatorio = deduplicar_matricula_mais_recente(
+            df, coluna_cpf, coluna_data,
+            coluna_data_encerramento=coluna_encerramento,
+            coluna_data_alocacao=coluna_alocacao,
+            coluna_data_atualizacao=coluna_atualizacao,
+        )
+    except (KeyError, ValueError) as exc:
         st.error(str(exc))
         return
 
@@ -212,11 +271,11 @@ briefing, implementada em `src/core/deduplicacao.py`.
     if relatorio.total_data_invalida_mantida:
         st.warning(
             f"{relatorio.total_data_invalida_mantida} registro(s) foram mantidos mesmo "
-            "com data não reconhecida na coluna escolhida (para não perder o aluno) — "
+            "sem nenhuma das datas reconhecida (para não perder o aluno) — "
             "vale conferir manualmente."
         )
 
-    st.write("**Resultado (uma linha por CPF, a mais recente):**")
+    st.write("**Resultado (uma linha por CPF, conforme a prioridade das datas):**")
     st.dataframe(df_final.head(50), width="stretch")
 
     botoes_download(df_final, nome_base="matriculas_deduplicadas", key_prefix="dedup")
@@ -316,7 +375,11 @@ relatórios:
 
 - **Cadastro** — CPFs que aparecem no SIGEDUC mas ainda não existem no SGP,
   já formatados no layout oficial de cadastro (24 colunas), prontos para
-  importar como aluno novo.
+  importar como aluno novo, mais uma 25ª coluna extra `SITUACAO_ALUNO`
+  (fora do layout oficial) com a situação de matrícula no SIGEDUC, só
+  para conferência. Enviando a planilha opcional de **Terços**, a coluna
+  `ESTUDANTE_ANO_PERIODO` (terço do EJA) também sai preenchida, cruzada
+  por CPF.
 - **Movimentação** — só os CPFs já cadastrados que tiveram
   **`trans. escola`** (mudou de CO_ENTIDADE) ou **`trans. mod`** (mesma
   escola, mas cruzou entre EJA e Regular/Técnico). Quem não teve nenhuma
@@ -339,6 +402,14 @@ Implementado em `src/core/movimentacao.py`.
         accept_multiple_files=True,
         key="upload_mov_sigeduc",
     )
+    arquivo_tercos = st.file_uploader(
+        "Planilha de Terços (SIGEDUC) — opcional",
+        type=["csv", "xlsx", "xls"],
+        key="upload_mov_tercos",
+        help="Só CPF + ano/período (terço) do EJA -- ex. colunas ESTUDANTE_CPF e "
+        "ESTUDANTE_ANO_PERIODO. Cruzada por CPF só para preencher essa coluna no "
+        "Cadastro; sem ela, ESTUDANTE_ANO_PERIODO sai em branco.",
+    )
     if arquivo_sgp is None or not arquivos_sigeduc:
         st.caption("Envie a base do SGP e ao menos uma planilha do SIGEDUC para continuar.")
         return
@@ -350,6 +421,7 @@ Implementado em `src/core/movimentacao.py`.
             for arquivo in arquivos_sigeduc
         ]
         df_sigeduc = pl.concat(partes_sigeduc, how="diagonal_relaxed")
+        df_tercos = carregar_planilha(arquivo_tercos) if arquivo_tercos is not None else None
     except Exception as exc:  # noqa: BLE001
         st.error(f"Não foi possível ler um dos arquivos: {exc}")
         return
@@ -437,6 +509,25 @@ Implementado em `src/core/movimentacao.py`.
             key="mov_serie_sigeduc",
         )
 
+        if df_tercos is not None:
+            st.caption("Terços (opcional):")
+            col_terco1, col_terco2 = st.columns(2)
+            coluna_cpf_terco = col_terco1.selectbox(
+                "Coluna de CPF",
+                options=df_tercos.columns,
+                index=_indice_padrao(df_tercos, COLUNAS_CPF_TERCO_CANDIDATAS),
+                key="mov_cpf_terco",
+            )
+            coluna_ano_periodo_terco = col_terco2.selectbox(
+                "Coluna de Ano/Período (terço)",
+                options=df_tercos.columns,
+                index=_indice_padrao(df_tercos, COLUNAS_ANO_PERIODO_TERCO_CANDIDATAS),
+                key="mov_ano_periodo_terco",
+            )
+        else:
+            coluna_cpf_terco = None
+            coluna_ano_periodo_terco = None
+
     if not st.button("▶️ Reconciliar bases", type="primary"):
         return
 
@@ -454,6 +545,9 @@ Implementado em `src/core/movimentacao.py`.
             coluna_data_matricula_sigeduc=coluna_data_matricula_sigeduc,
             coluna_oferta_sigeduc=coluna_oferta_sigeduc,
             coluna_serie_sigeduc=coluna_serie_sigeduc,
+            df_tercos=df_tercos,
+            coluna_cpf_terco=coluna_cpf_terco,
+            coluna_ano_periodo_terco=coluna_ano_periodo_terco,
         )
     except KeyError as exc:
         st.error(str(exc))
@@ -487,6 +581,12 @@ Implementado em `src/core/movimentacao.py`.
             "ℹ️ Não encontrei uma coluna de 'Data Atualização do Cadastro' no SIGEDUC -- "
             "usei só a Data Encerramento como referência de data."
         )
+    if relatorio.coluna_cpf_terco is not None and relatorio.total_cadastro_sem_terco:
+        st.caption(
+            f"ℹ️ {relatorio.total_cadastro_sem_terco} de {relatorio.total_cadastro} CPF(s) do "
+            "Cadastro não têm terço correspondente na planilha de Terços enviada -- "
+            "ESTUDANTE_ANO_PERIODO ficou em branco para eles."
+        )
 
     aba_cad, aba_mov = st.tabs(
         [f"📥 Cadastro ({df_cadastro.height})", f"🔀 Movimentação ({df_movimentacao.height})"]
@@ -503,15 +603,46 @@ def pagina_frequencia() -> None:
     st.title("📅 D. Cálculo de Frequência")
     st.markdown(
         """
-Cruza a base atual do **SGP** com a base bruta do **SIGEDUC** (pelo CPF) e
-devolve a frequência corrigida:
+Dois modos, dependendo do que você já tem disponível:
 
-1. A partir do SIGEDUC, calcula `HL_PRESENTE_PERIODO = HORA_AULA_DADA - FALTAS_ALUNO_HORA`.
-2. Para cada aluno encontrado nas duas bases, fica sempre com o **maior**
-   valor entre o que já estava no SGP e o calculado a partir do SIGEDUC —
+- **🔄 Atualizar frequência existente** — cruza uma base do SGP que **já
+  tem** frequência lançada com a base bruta do SIGEDUC (pelo CPF **e**
+  pela matrícula exata do aluno) e fica com o maior valor entre os dois.
+  Não descarta nenhuma linha do SGP.
+- **🆕 Gerar frequência nova** — monta a planilha de frequência **do
+  zero**, só a partir da base bruta do SIGEDUC (sem precisar de nenhuma
+  frequência já lançada no SGP) — pensado para a primeira carga do
+  período.
+"""
+    )
+
+    modo = st.radio(
+        "Modo",
+        options=[
+            "🔄 Atualizar frequência existente (SGP + SIGEDUC)",
+            "🆕 Gerar frequência nova (a partir do SIGEDUC)",
+        ],
+        key="freq_modo",
+    )
+
+    def _padrao(colunas: list[str], candidatos: tuple[str, ...]) -> str:
+        return next((c for c in candidatos if c in colunas), colunas[0])
+
+    if modo.startswith("🔄"):
+        st.markdown(
+            """
+1. Lê `HL_OFERTADA_PERIODO`/`HL_PRESENTE_PERIODO` direto da base do SIGEDUC
+   (já vêm prontos na fonte).
+2. Cruza SGP × SIGEDUC pelo CPF **e** pela matrícula exata (`ID_SGP_MATRICULA`
+   no SGP / `Matrícula SGP` no SIGEDUC) — não basta o CPF bater, porque o
+   mesmo aluno pode ter mais de uma matrícula, e cruzar só por CPF podia
+   pegar a frequência de uma matrícula errada.
+3. Para cada matrícula encontrada nas duas bases, fica sempre com o
+   **maior** valor entre o que já estava no SGP e o que veio do SIGEDUC —
    a frequência lançada nunca diminui por causa deste cruzamento. Quem não
-   aparece no SIGEDUC mantém o valor do SGP sem alteração.
-3. Quem teve o valor alterado é classificado conforme o percentual de
+   aparece no SIGEDUC (mesmo CPF e matrícula) mantém o valor do SGP sem
+   alteração.
+4. Quem teve o valor alterado é classificado conforme o percentual de
    presença (`HL_PRESENTE / HL_OFERTADA`): **subiu**, **desceu (abaixo de
    80%)**, **desceu (acima de 80%)**, ou **manteve o percentual** (só a
    carga horária mudou).
@@ -521,111 +652,340 @@ sempre com o mesmo número de linhas da planilha do SGP enviada, pronta para
 reenvio. Implementado com um `LEFT JOIN` em SQL no DuckDB, em
 `src/core/frequencia.py`.
 """
+        )
+
+        col_up1, col_up2 = st.columns(2)
+        arquivo_sgp = col_up1.file_uploader(
+            "Base SGP (atual)", type=["csv", "xlsx", "xls"], key="upload_freq_sgp"
+        )
+        arquivo_sigeduc = col_up2.file_uploader(
+            "Base SIGEDUC (bruta)", type=["csv", "xlsx", "xls"], key="upload_freq_sigeduc"
+        )
+        if arquivo_sgp is None or arquivo_sigeduc is None:
+            st.caption("Envie as duas planilhas (SGP e SIGEDUC) para continuar.")
+            return
+
+        try:
+            df_sgp = carregar_planilha(arquivo_sgp)
+            df_sigeduc = carregar_planilha(arquivo_sigeduc)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Não foi possível ler um dos arquivos: {exc}")
+            return
+
+        st.write(
+            f"SGP: **{df_sgp.height} linhas** × **{df_sgp.width} colunas** · "
+            f"SIGEDUC: **{df_sigeduc.height} linhas** × **{df_sigeduc.width} colunas**."
+        )
+
+        col1, col2 = st.columns(2)
+        coluna_cpf_sgp = col1.selectbox(
+            "Coluna de CPF (base SGP)",
+            options=df_sgp.columns,
+            index=df_sgp.columns.index(_padrao(df_sgp.columns, COLUNAS_CPF_SGP_CANDIDATAS)),
+        )
+        coluna_cpf_sigeduc = col2.selectbox(
+            "Coluna de CPF (base SIGEDUC)",
+            options=df_sigeduc.columns,
+            index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_CPF_SIGEDUC_CANDIDATAS)),
+        )
+
+        col_mat1, col_mat2 = st.columns(2)
+        coluna_matricula_sgp = col_mat1.selectbox(
+            "Coluna de matrícula do aluno (ID_SGP_MATRICULA, base SGP)",
+            options=df_sgp.columns,
+            index=df_sgp.columns.index(_padrao(df_sgp.columns, COLUNAS_MATRICULA_SGP_CANDIDATAS)),
+        )
+        coluna_matricula_sigeduc = col_mat2.selectbox(
+            "Coluna de matrícula do aluno (Matrícula SGP, base SIGEDUC)",
+            options=df_sigeduc.columns,
+            index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_MATRICULA_SIGEDUC_CANDIDATAS)),
+        )
+
+        col3, col4 = st.columns(2)
+        coluna_ofertada = col3.selectbox(
+            "Coluna de horas ofertadas no período (base SGP)",
+            options=df_sgp.columns,
+            index=df_sgp.columns.index(_padrao(df_sgp.columns, COLUNAS_OFERTADA_CANDIDATAS)),
+        )
+        coluna_presente = col4.selectbox(
+            "Coluna de horas de presença no período (base SGP)",
+            options=df_sgp.columns,
+            index=df_sgp.columns.index(_padrao(df_sgp.columns, COLUNAS_PRESENTE_CANDIDATAS)),
+        )
+
+        col5, col6 = st.columns(2)
+        coluna_ofertada_sigeduc = col5.selectbox(
+            "Coluna de horas ofertadas no período (base SIGEDUC)",
+            options=df_sigeduc.columns,
+            index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_OFERTADA_CANDIDATAS)),
+        )
+        coluna_presente_sigeduc = col6.selectbox(
+            "Coluna de horas de presença no período (base SIGEDUC)",
+            options=df_sigeduc.columns,
+            index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_PRESENTE_CANDIDATAS)),
+        )
+
+        if not st.button("▶️ Calcular Frequência", type="primary"):
+            return
+
+        try:
+            df_atualizado, df_alterados, relatorio = calcular_frequencia(
+                df_sgp,
+                df_sigeduc,
+                coluna_cpf_sgp,
+                coluna_cpf_sigeduc,
+                coluna_ofertada,
+                coluna_presente,
+                coluna_ofertada_sigeduc,
+                coluna_presente_sigeduc,
+                coluna_matricula_sgp,
+                coluna_matricula_sigeduc,
+            )
+        except KeyError as exc:
+            st.error(str(exc))
+            return
+
+        st.success("Frequência calculada.")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("SGP", relatorio.total_sgp)
+        m2.metric("SIGEDUC (após limpeza)", relatorio.total_sigeduc_apos_limpeza)
+        m3.metric("Com correspondência", relatorio.total_com_correspondencia_sigeduc)
+        m4.metric("Sem correspondência", relatorio.total_sem_correspondencia_sigeduc)
+
+        m5, m6, m7, m8, m9 = st.columns(5)
+        m5.metric("Alterados", relatorio.total_alterados)
+        m6.metric("Subiu", relatorio.total_subiu)
+        m7.metric("Desceu < 80%", relatorio.total_desceu_abaixo_80)
+        m8.metric("Desceu ≥ 80%", relatorio.total_desceu_acima_80)
+        m9.metric("Manteve %", relatorio.total_manteve_percentual)
+
+        if relatorio.total_sem_correspondencia_sigeduc:
+            st.caption(
+                f"ℹ️ {relatorio.total_sem_correspondencia_sigeduc} aluno(s)/matrícula(s) do SGP não "
+                "encontraram correspondência (por CPF + matrícula) na base SIGEDUC enviada — a "
+                "frequência desses alunos foi mantida sem alteração."
+            )
+        if relatorio.total_desceu_abaixo_80:
+            st.warning(
+                f"⚠️ {relatorio.total_desceu_abaixo_80} aluno(s) tiveram o percentual de presença "
+                "reduzido para abaixo de 80% — vale conferir antes de reenviar."
+            )
+
+        aba_atualizada, aba_alterados = st.tabs(
+            [f"📋 Frequência Atualizada ({df_atualizado.height})", f"🔎 Alterados ({df_alterados.height})"]
+        )
+        with aba_atualizada:
+            st.caption("Base do SGP inteira, com a frequência já corrigida — pronta para reenvio.")
+            st.dataframe(df_atualizado.head(50), width="stretch")
+            botoes_download(df_atualizado, nome_base="frequencia_atualizada", key_prefix="freq_atual")
+        with aba_alterados:
+            st.caption("Somente quem teve o valor alterado, com o valor anterior para conferência.")
+            st.dataframe(df_alterados.head(50), width="stretch")
+            botoes_download(df_alterados, nome_base="frequencia_alterados", key_prefix="freq_alt")
+        return
+
+    # --- 🆕 Gerar frequência nova (a partir do SIGEDUC) ---
+    st.markdown(
+        """
+Monta a frequência **do zero** a partir da base bruta do SIGEDUC — sem
+precisar de nenhuma frequência já lançada no SGP. `ESTUDANTE_ETAPA_DE_ENSINO`
+é calculada como no **Módulo B** (Oferta de Ensino + Série). Opcionalmente,
+cruza por CPF com planilhas à parte de **Terços** e de **ID_SGP** para
+preencher `ESTUDANTE_ANO_PERIODO`/`ID_SGP_MATRICULA`. Reproduz o script
+legado `FREQUENCIA_2026`, em `src/core/frequencia.py`.
+"""
     )
 
-    col_up1, col_up2 = st.columns(2)
-    arquivo_sgp = col_up1.file_uploader(
-        "Base SGP (atual)", type=["csv", "xlsx", "xls"], key="upload_freq_sgp"
+    arquivo_sigeduc_novo = st.file_uploader(
+        "Base SIGEDUC (bruta)", type=["csv", "xlsx", "xls"], key="upload_freq_novo_sigeduc"
     )
-    arquivo_sigeduc = col_up2.file_uploader(
-        "Base SIGEDUC (bruta)", type=["csv", "xlsx", "xls"], key="upload_freq_sigeduc"
+
+    col_aux1, col_aux2 = st.columns(2)
+    arquivo_tercos_novo = col_aux1.file_uploader(
+        "Planilha de Terços (SIGEDUC) — opcional",
+        type=["csv", "xlsx", "xls"],
+        key="upload_freq_novo_tercos",
+        help="Só CPF + ano/período (terço) do EJA -- cruzada por CPF só para preencher "
+        "ESTUDANTE_ANO_PERIODO; sem ela, essa coluna sai em branco.",
     )
-    if arquivo_sgp is None or arquivo_sigeduc is None:
-        st.caption("Envie as duas planilhas (SGP e SIGEDUC) para continuar.")
+    arquivo_id_sgp_novo = col_aux2.file_uploader(
+        "Planilha de ID_SGP — opcional",
+        type=["csv", "xlsx", "xls"],
+        key="upload_freq_novo_id_sgp",
+        help="Só CPF + ID_SGP_MATRICULA -- cruzada por CPF só para preencher "
+        "ID_SGP_MATRICULA; sem ela, essa coluna sai em branco.",
+    )
+
+    if arquivo_sigeduc_novo is None:
+        st.caption("Envie a planilha do SIGEDUC para continuar.")
         return
 
     try:
-        df_sgp = carregar_planilha(arquivo_sgp)
-        df_sigeduc = carregar_planilha(arquivo_sigeduc)
+        df_sigeduc_novo = carregar_planilha(arquivo_sigeduc_novo)
+        df_tercos_novo = carregar_planilha(arquivo_tercos_novo) if arquivo_tercos_novo is not None else None
+        df_id_sgp_novo = carregar_planilha(arquivo_id_sgp_novo) if arquivo_id_sgp_novo is not None else None
     except Exception as exc:  # noqa: BLE001
         st.error(f"Não foi possível ler um dos arquivos: {exc}")
         return
 
-    st.write(
-        f"SGP: **{df_sgp.height} linhas** × **{df_sgp.width} colunas** · "
-        f"SIGEDUC: **{df_sigeduc.height} linhas** × **{df_sigeduc.width} colunas**."
-    )
-
-    def _padrao(colunas: list[str], candidatos: tuple[str, ...]) -> str:
-        return next((c for c in candidatos if c in colunas), colunas[0])
+    st.write(f"SIGEDUC: **{df_sigeduc_novo.height} linhas** × **{df_sigeduc_novo.width} colunas**.")
 
     col1, col2 = st.columns(2)
-    coluna_cpf_sgp = col1.selectbox(
-        "Coluna de CPF (base SGP)",
-        options=df_sgp.columns,
-        index=df_sgp.columns.index(_padrao(df_sgp.columns, COLUNAS_CPF_SGP_CANDIDATAS)),
+    coluna_cpf_novo = col1.selectbox(
+        "Coluna de CPF",
+        options=df_sigeduc_novo.columns,
+        index=df_sigeduc_novo.columns.index(_padrao(df_sigeduc_novo.columns, COLUNAS_CPF_SIGEDUC_CANDIDATAS)),
+        key="freq_novo_cpf",
     )
-    coluna_cpf_sigeduc = col2.selectbox(
-        "Coluna de CPF (base SIGEDUC)",
-        options=df_sigeduc.columns,
-        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_CPF_SIGEDUC_CANDIDATAS)),
+    coluna_entidade_novo = col2.selectbox(
+        "Coluna do código da entidade/escola",
+        options=df_sigeduc_novo.columns,
+        index=df_sigeduc_novo.columns.index(_padrao(df_sigeduc_novo.columns, COLUNAS_ENTIDADE_SIGEDUC_CANDIDATAS)),
+        key="freq_novo_entidade",
     )
 
     col3, col4 = st.columns(2)
-    coluna_ofertada = col3.selectbox(
-        "Coluna de horas ofertadas no período (base SGP)",
-        options=df_sgp.columns,
-        index=df_sgp.columns.index(_padrao(df_sgp.columns, COLUNAS_OFERTADA_CANDIDATAS)),
+    coluna_oferta_novo = col3.selectbox(
+        "Coluna de Oferta de Ensino",
+        options=df_sigeduc_novo.columns,
+        index=df_sigeduc_novo.columns.index(_padrao(df_sigeduc_novo.columns, COLUNAS_OFERTA_CANDIDATAS)),
+        key="freq_novo_oferta",
     )
-    coluna_presente = col4.selectbox(
-        "Coluna de horas de presença no período (base SGP)",
-        options=df_sgp.columns,
-        index=df_sgp.columns.index(_padrao(df_sgp.columns, COLUNAS_PRESENTE_CANDIDATAS)),
-    )
-    st.caption(
-        "A base SIGEDUC precisa ter as colunas `HORA_AULA_DADA` e `FALTAS_ALUNO_HORA` "
-        "(nomes fixos, conforme o export padrão do SIGEDUC)."
+    coluna_serie_novo = col4.selectbox(
+        "Coluna de Série",
+        options=df_sigeduc_novo.columns,
+        index=df_sigeduc_novo.columns.index(_padrao(df_sigeduc_novo.columns, COLUNAS_SERIE_CANDIDATAS)),
+        key="freq_novo_serie",
     )
 
-    if not st.button("▶️ Calcular Frequência", type="primary"):
+    col5, col6, col7 = st.columns(3)
+    coluna_mes_novo = col5.selectbox(
+        "Coluna de Mês de Referência",
+        options=df_sigeduc_novo.columns,
+        index=df_sigeduc_novo.columns.index(_padrao(df_sigeduc_novo.columns, COLUNAS_MES_REFERENCIA_CANDIDATAS)),
+        key="freq_novo_mes",
+    )
+    coluna_hora_dada_novo = col6.selectbox(
+        "Coluna de Horas de Aula Dada",
+        options=df_sigeduc_novo.columns,
+        index=df_sigeduc_novo.columns.index(_padrao(df_sigeduc_novo.columns, COLUNA_HORA_AULA_DADA)),
+        key="freq_novo_hora_dada",
+    )
+    coluna_faltas_novo = col7.selectbox(
+        "Coluna de Faltas do Aluno (horas)",
+        options=df_sigeduc_novo.columns,
+        index=df_sigeduc_novo.columns.index(_padrao(df_sigeduc_novo.columns, COLUNA_FALTAS_ALUNO_HORA)),
+        key="freq_novo_faltas",
+    )
+
+    ano_novo = st.number_input(
+        "Ano (NU_ANO_MATRICULA / ANO_REFERENCIA)",
+        min_value=2000,
+        max_value=2100,
+        value=datetime.date.today().year,
+        step=1,
+        key="freq_novo_ano",
+    )
+
+    if df_tercos_novo is not None:
+        st.caption("Terços (opcional):")
+        col_t1, col_t2 = st.columns(2)
+        coluna_cpf_terco_novo = col_t1.selectbox(
+            "Coluna de CPF (Terços)",
+            options=df_tercos_novo.columns,
+            index=df_tercos_novo.columns.index(
+                _padrao(df_tercos_novo.columns, COLUNAS_CPF_TERCO_FREQ_CANDIDATAS)
+            ),
+            key="freq_novo_cpf_terco",
+        )
+        coluna_ano_periodo_terco_novo = col_t2.selectbox(
+            "Coluna de Ano/Período (Terços)",
+            options=df_tercos_novo.columns,
+            index=df_tercos_novo.columns.index(
+                _padrao(df_tercos_novo.columns, COLUNAS_ANO_PERIODO_TERCO_FREQ_CANDIDATAS)
+            ),
+            key="freq_novo_ano_periodo_terco",
+        )
+    else:
+        coluna_cpf_terco_novo = None
+        coluna_ano_periodo_terco_novo = None
+
+    if df_id_sgp_novo is not None:
+        st.caption("ID_SGP (opcional):")
+        col_i1, col_i2 = st.columns(2)
+        coluna_cpf_id_sgp_novo = col_i1.selectbox(
+            "Coluna de CPF (ID_SGP)",
+            options=df_id_sgp_novo.columns,
+            index=df_id_sgp_novo.columns.index(_padrao(df_id_sgp_novo.columns, COLUNAS_CPF_ID_SGP_CANDIDATAS)),
+            key="freq_novo_cpf_id_sgp",
+        )
+        coluna_id_sgp_matricula_novo = col_i2.selectbox(
+            "Coluna de ID_SGP_MATRICULA",
+            options=df_id_sgp_novo.columns,
+            index=df_id_sgp_novo.columns.index(
+                _padrao(df_id_sgp_novo.columns, COLUNAS_ID_SGP_MATRICULA_CANDIDATAS)
+            ),
+            key="freq_novo_id_sgp_matricula",
+        )
+    else:
+        coluna_cpf_id_sgp_novo = None
+        coluna_id_sgp_matricula_novo = None
+
+    if not st.button("▶️ Gerar Frequência Nova", type="primary"):
         return
 
     try:
-        df_atualizado, df_alterados, relatorio = calcular_frequencia(
-            df_sgp, df_sigeduc, coluna_cpf_sgp, coluna_cpf_sigeduc, coluna_ofertada, coluna_presente
+        df_frequencia_nova, relatorio_novo = gerar_frequencia_do_sigeduc(
+            df_sigeduc_novo,
+            ano=int(ano_novo),
+            coluna_cpf_sigeduc=coluna_cpf_novo,
+            coluna_entidade=coluna_entidade_novo,
+            coluna_oferta=coluna_oferta_novo,
+            coluna_serie=coluna_serie_novo,
+            coluna_mes_referencia=coluna_mes_novo,
+            coluna_hora_aula_dada=coluna_hora_dada_novo,
+            coluna_faltas_aluno_hora=coluna_faltas_novo,
+            df_tercos=df_tercos_novo,
+            coluna_cpf_terco=coluna_cpf_terco_novo,
+            coluna_ano_periodo_terco=coluna_ano_periodo_terco_novo,
+            df_id_sgp=df_id_sgp_novo,
+            coluna_cpf_id_sgp=coluna_cpf_id_sgp_novo,
+            coluna_id_sgp_matricula=coluna_id_sgp_matricula_novo,
         )
     except KeyError as exc:
         st.error(str(exc))
         return
 
-    st.success("Frequência calculada.")
+    st.success("Frequência nova gerada.")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("SGP", relatorio.total_sgp)
-    m2.metric("SIGEDUC (após limpeza)", relatorio.total_sigeduc_apos_limpeza)
-    m3.metric("Com correspondência", relatorio.total_com_correspondencia_sigeduc)
-    m4.metric("Sem correspondência", relatorio.total_sem_correspondencia_sigeduc)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("SIGEDUC (enviado)", relatorio_novo.total_sigeduc)
+    m2.metric("Frequência gerada", relatorio_novo.total_sigeduc_apos_limpeza)
+    m3.metric("Etapa não mapeada", relatorio_novo.total_etapa_nao_mapeada)
 
-    m5, m6, m7, m8, m9 = st.columns(5)
-    m5.metric("Alterados", relatorio.total_alterados)
-    m6.metric("Subiu", relatorio.total_subiu)
-    m7.metric("Desceu < 80%", relatorio.total_desceu_abaixo_80)
-    m8.metric("Desceu ≥ 80%", relatorio.total_desceu_acima_80)
-    m9.metric("Manteve %", relatorio.total_manteve_percentual)
-
-    if relatorio.total_sem_correspondencia_sigeduc:
-        st.caption(
-            f"ℹ️ {relatorio.total_sem_correspondencia_sigeduc} aluno(s) do SGP não foram "
-            "encontrados na base SIGEDUC enviada — a frequência desses alunos foi mantida "
-            "sem alteração."
-        )
-    if relatorio.total_desceu_abaixo_80:
+    if relatorio_novo.total_etapa_nao_mapeada:
         st.warning(
-            f"⚠️ {relatorio.total_desceu_abaixo_80} aluno(s) tiveram o percentual de presença "
-            "reduzido para abaixo de 80% — vale conferir antes de reenviar."
+            f"⚠️ {relatorio_novo.total_etapa_nao_mapeada} registro(s) ficaram com "
+            "ESTUDANTE_ETAPA_DE_ENSINO = 'NAO_MAPEADO' — vale conferir Oferta de Ensino / "
+            "Série desses casos."
+        )
+    if relatorio_novo.coluna_cpf_terco is not None and relatorio_novo.total_sem_terco:
+        st.caption(
+            f"ℹ️ {relatorio_novo.total_sem_terco} de {relatorio_novo.total_sigeduc_apos_limpeza} "
+            "CPF(s) não têm terço correspondente na planilha de Terços enviada — "
+            "ESTUDANTE_ANO_PERIODO ficou em branco para eles."
+        )
+    if relatorio_novo.coluna_cpf_id_sgp is not None and relatorio_novo.total_sem_id_sgp:
+        st.caption(
+            f"ℹ️ {relatorio_novo.total_sem_id_sgp} de {relatorio_novo.total_sigeduc_apos_limpeza} "
+            "CPF(s) não têm ID_SGP correspondente na planilha enviada — ID_SGP_MATRICULA "
+            "ficou em branco para eles."
         )
 
-    aba_atualizada, aba_alterados = st.tabs(
-        [f"📋 Frequência Atualizada ({df_atualizado.height})", f"🔎 Alterados ({df_alterados.height})"]
-    )
-    with aba_atualizada:
-        st.caption("Base do SGP inteira, com a frequência já corrigida — pronta para reenvio.")
-        st.dataframe(df_atualizado.head(50), width="stretch")
-        botoes_download(df_atualizado, nome_base="frequencia_atualizada", key_prefix="freq_atual")
-    with aba_alterados:
-        st.caption("Somente quem teve o valor alterado, com o valor anterior para conferência.")
-        st.dataframe(df_alterados.head(50), width="stretch")
-        botoes_download(df_alterados, nome_base="frequencia_alterados", key_prefix="freq_alt")
+    st.write("**Pré-visualização do resultado:**")
+    st.dataframe(df_frequencia_nova.head(50), width="stretch")
+    botoes_download(df_frequencia_nova, nome_base="frequencia_nova", key_prefix="freq_novo")
 
 
 def pagina_exportacao() -> None:
@@ -1012,6 +1372,206 @@ Módulo F.
     botoes_download(df_resultado, nome_base="situacao_sigeduc", key_prefix="sitsig")
 
 
+def pagina_comparacao_situacao() -> None:
+    st.title("🔎 H. Comparar Situação SIGEDUC × SGP")
+    st.write(
+        "Envie as duas planilhas e escolha as colunas de CPF, data da matrícula e situação. "
+        "No SIGEDUC, escolha também a série/ano. A comparação usa o CPF e a "
+        "mesma data de matrícula nas duas bases e mostra apenas situações diferentes."
+    )
+    with st.expander("Ver equivalências usadas na comparação"):
+        st.table(pl.DataFrame({
+            "Texto no SIGEDUC": [
+                "TRANSFERIDO", "ABANDONO", "APROVADO / PROGRESSÃO PARCIAL / AVANÇO DE ESTUDOS",
+                "APROVADO no 3º ou 4º ano/série", "CONCLUINTE", "REPROVADO / REPR. FREQUÊNCIA",
+            ],
+            "Código equivalente no SGP": ["2, 3, 4 ou 5", "7", "10", "11", "11", "12"],
+        }))
+    st.caption(
+        "O resultado mantém todas as colunas da planilha SGP na ordem original. "
+        "Ao final, acrescenta o CPF normalizado e os dados da comparação."
+    )
+
+    esquerda, direita = st.columns(2)
+    arquivo_sigeduc = esquerda.file_uploader(
+        "Planilha SIGEDUC", type=["csv", "xlsx", "xls"], key="comp_sigeduc"
+    )
+    arquivo_sgp = direita.file_uploader(
+        "Planilha SGP", type=["csv", "xlsx", "xls"], key="comp_sgp"
+    )
+    if arquivo_sigeduc is None or arquivo_sgp is None:
+        st.caption("Envie as duas planilhas para configurar a comparação.")
+        return
+
+    try:
+        sigeduc = carregar_planilha(arquivo_sigeduc)
+        sgp = carregar_planilha(arquivo_sgp)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler uma das planilhas: {exc}")
+        return
+    if not sigeduc.columns or not sgp.columns:
+        st.error("As duas planilhas precisam ter cabeçalhos de coluna.")
+        return
+
+    def selecionar(titulo: str, df: pl.DataFrame, candidatos: tuple[str, ...], chave: str) -> str:
+        sugerida = encontrar_coluna(df, candidatos)
+        return st.selectbox(
+            titulo, df.columns,
+            index=df.columns.index(sugerida) if sugerida else 0,
+            key=f"comp_{chave}",
+        )
+
+    with esquerda:
+        st.subheader("SIGEDUC")
+        cpf_sig = selecionar("CPF", sigeduc, ("ESTUDANTE_CPF", "CPF", "NU_CPF"), "cpf_sig")
+        data_sig = selecionar("Data de matrícula", sigeduc, ("DATA_INICIO_MATRICULA", "DATA MATRICULA", "DATA DE MATRÍCULA"), "data_sig")
+        situacao_sig = selecionar("Situação final", sigeduc, ("SITUACAO_MATRICULA", "SITUAÇÃO MATRÍCULA", "SITUACAO_FINAL", "SITUACAO", "SITUAÇÃO"), "situacao_sig")
+        serie_sig = selecionar("Série/ano", sigeduc, ("SERIE", "SÉRIE", "ANO_SERIE", "ANO/SÉRIE", "PERIODO"), "serie_sig")
+    with direita:
+        st.subheader("SGP")
+        cpf_sgp = selecionar("CPF", sgp, ("ESTUDANTE_CPF", "CPF", "NU_CPF"), "cpf_sgp")
+        data_sgp = selecionar("Data de matrícula", sgp, ("DATA_INICIO_MATRICULA", "DATA MATRICULA", "DATA DE MATRÍCULA"), "data_sgp")
+        situacao_sgp = selecionar("Código da situação final", sgp, ("ESTUDANTE_SITUACAO_MATRICULA", "SITUACAO_MATRICULA", "SITUAÇÃO MATRÍCULA", "SITUACAO_FINAL", "CODIGO_SITUACAO", "SITUACAO", "SITUAÇÃO"), "situacao_sgp")
+
+    st.caption(
+        "Somente matrículas com CPF e data iguais nas duas planilhas entram na comparação. "
+        "Se houver linhas repetidas com o mesmo CPF e data, vale a última linha do arquivo. "
+        "Datas vazias ou inválidas ficam fora. "
+        "APROVADO no 3º ou 4º ano corresponde ao código 11 no SGP."
+    )
+    if not st.button("▶️ Comparar situações", type="primary", key="comparar_situacoes"):
+        return
+
+    try:
+        divergencias, resumo = comparar_situacoes(
+            sigeduc, sgp,
+            cpf_sigeduc=cpf_sig, data_sigeduc=data_sig,
+            situacao_sigeduc=situacao_sig, serie_sigeduc=serie_sig,
+            cpf_sgp=cpf_sgp, data_sgp=data_sgp, situacao_sgp=situacao_sgp,
+        )
+    except (KeyError, ValueError) as exc:
+        st.error(str(exc))
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("CPFs no SIGEDUC com data válida", resumo["sigeduc_unicos"])
+    col2.metric("CPFs presentes nas duas", resumo["cpfs_em_ambas"])
+    col3.metric("Matrículas com mesma data", resumo["matriculas_em_ambas"])
+    col4.metric("Situações diferentes", resumo["divergencias"])
+    if divergencias.is_empty():
+        st.success("Nenhuma divergência encontrada entre as matrículas com CPF e data iguais.")
+        return
+    st.dataframe(divergencias, width="stretch", hide_index=True)
+    st.download_button(
+        "⬇️ Baixar divergências em XLSX",
+        data=para_bytes_excel(divergencias),
+        file_name="divergencias_situacao_sigeduc_sgp.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="comp_download_xlsx",
+    )
+
+
+def pagina_comparacao_serie() -> None:
+    st.title("📚 I. Comparar Série/Ano SIGEDUC × SGP")
+    st.write(
+        "Envie as planilhas, escolha as colunas de CPF e série/ano de cada uma "
+        "e veja apenas os alunos presentes nas duas bases com séries diferentes."
+    )
+    esquerda, direita = st.columns(2)
+    arquivo_sigeduc = esquerda.file_uploader(
+        "Planilha SIGEDUC", type=["csv", "xlsx", "xls"], key="serie_upload_sigeduc"
+    )
+    arquivo_sgp = direita.file_uploader(
+        "Planilha SGP", type=["csv", "xlsx", "xls"], key="serie_upload_sgp"
+    )
+    if arquivo_sigeduc is None or arquivo_sgp is None:
+        st.caption("Envie as duas planilhas para configurar a comparação.")
+        return
+    try:
+        sigeduc = carregar_planilha(arquivo_sigeduc)
+        sgp = carregar_planilha(arquivo_sgp)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler uma das planilhas: {exc}")
+        return
+    if not sigeduc.columns or not sgp.columns:
+        st.error("As duas planilhas precisam ter cabeçalhos de coluna.")
+        return
+
+    def selecionar(titulo: str, df: pl.DataFrame, candidatos: tuple[str, ...], chave: str) -> str:
+        sugerida = encontrar_coluna(df, candidatos)
+        return st.selectbox(
+            titulo, options=df.columns,
+            index=df.columns.index(sugerida) if sugerida else 0,
+            key=f"serie_{chave}",
+        )
+
+    with esquerda:
+        st.subheader("SIGEDUC")
+        cpf_sig = selecionar("Coluna de CPF", sigeduc, ("ESTUDANTE_CPF", "CPF", "NU_CPF"), "cpf_sig")
+        serie_sig = selecionar("Coluna de série/ano", sigeduc, ("SÉRIE", "SERIE", "ANO_SERIE", "ANO/SÉRIE"), "serie_sig")
+    with direita:
+        st.subheader("SGP")
+        cpf_sgp = selecionar("Coluna de CPF", sgp, ("ESTUDANTE_CPF", "CPF", "NU_CPF"), "cpf_sgp")
+        serie_sgp = selecionar("Coluna de série/ano ou etapa", sgp, ("SÉRIE", "SERIE", "ANO_SERIE", "ANO/SÉRIE", "ESTUDANTE_ETAPA_DE_ENSINO"), "serie_sgp")
+
+    with st.expander("CPF repetido: escolher a matrícula mais recente (opcional)"):
+        st.caption(
+            "Se você selecionar uma data em cada planilha, vale o registro mais recente "
+            "daquele CPF. Sem data, ou em empate, vale a última linha do arquivo."
+        )
+        col1, col2 = st.columns(2)
+        def selecionar_data(container, titulo: str, df: pl.DataFrame, chave: str) -> str | None:
+            sugerida = encontrar_coluna(df, COLUNAS_DATA_CANDIDATAS)
+            opcoes = [None, *df.columns]
+            return container.selectbox(
+                titulo, options=opcoes,
+                index=opcoes.index(sugerida) if sugerida else 0,
+                format_func=lambda valor: "Não usar data" if valor is None else valor,
+                key=f"serie_{chave}",
+            )
+        data_sig = selecionar_data(col1, "Data de matrícula SIGEDUC", sigeduc, "data_sig")
+        data_sgp = selecionar_data(col2, "Data de matrícula SGP", sgp, "data_sgp")
+
+    st.caption(
+        "A comparação ignora diferenças de escrita como '3ª série' e '3º ano'. "
+        "Se a coluna do SGP for ESTUDANTE_ETAPA_DE_ENSINO, os códigos 25–28 e 30–33 "
+        "são convertidos para a série correspondente. O código 45 (EJA) não informa série."
+    )
+    if not st.button("▶️ Comparar séries", type="primary", key="serie_comparar"):
+        return
+    try:
+        divergencias, resumo = comparar_series(
+            sigeduc, sgp,
+            cpf_sigeduc=cpf_sig, serie_sigeduc=serie_sig,
+            cpf_sgp=cpf_sgp, serie_sgp=serie_sgp,
+            data_sigeduc=data_sig, data_sgp=data_sgp,
+        )
+    except (KeyError, ValueError) as exc:
+        st.error(str(exc))
+        return
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("CPFs únicos no SIGEDUC", resumo["sigeduc_unicos"])
+    col2.metric("CPFs presentes nas duas", resumo["cpfs_em_ambas"])
+    col3.metric("Séries diferentes", resumo["divergencias"])
+    if resumo["sem_serie_comparavel"]:
+        st.warning(
+            f"{resumo['sem_serie_comparavel']} CPF(s) em ambas as bases não puderam ser "
+            "comparados porque a série está vazia ou o SGP usa o código 45 (EJA)."
+        )
+    if divergencias.is_empty():
+        st.success("Nenhuma divergência de série/ano encontrada entre os CPFs comparáveis.")
+        return
+    st.dataframe(divergencias, width="stretch", hide_index=True)
+    st.download_button(
+        "⬇️ Baixar divergências em XLSX",
+        data=para_bytes_excel(divergencias),
+        file_name="divergencias_serie_sigeduc_sgp.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="serie_download_xlsx",
+    )
+
+
 def pagina_em_breve(titulo: str) -> None:
     st.title(titulo)
     st.info(
@@ -1030,6 +1590,8 @@ PAGINAS_IMPLEMENTADAS = {
     "exportacao": pagina_exportacao,
     "situacao_aluno": pagina_situacao_aluno,
     "situacao_sigeduc": pagina_situacao_sigeduc,
+    "comparacao_situacao": pagina_comparacao_situacao,
+    "comparacao_serie": pagina_comparacao_serie,
 }
 
 with st.sidebar:
@@ -1038,7 +1600,7 @@ with st.sidebar:
     pagina = st.radio("Módulo", list(MODULOS_CORE.keys()), index=0)
     st.divider()
     st.caption(
-        "Os 7 módulos do briefing (A-G) estão implementados em `src/core`. "
+        "Os módulos A-I estão implementados em `src/core`. "
         "Cada um valida as colunas que recebe e mostra um erro claro se "
         "alguma estiver faltando."
     )

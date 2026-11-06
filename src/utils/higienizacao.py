@@ -68,14 +68,25 @@ def _aplicar(coluna: pl.Series | pl.Expr, construir_expr) -> pl.Series | pl.Expr
 
 
 def limpar_cpf(coluna: pl.Series | pl.Expr) -> pl.Series | pl.Expr:
-    """Padroniza uma coluna de CPF.
+    """Padroniza uma coluna de CPF -- pensada especificamente para cruzar
+    duas bases que representam o **mesmo** CPF de formas diferentes (ex.:
+    uma planilha com pontos/traços e zero à esquerda, tipo
+    ``"012.345.678-99"``, e outra só com os dígitos e sem zero à esquerda,
+    tipo ``1234567899``, porque a coluna foi lida/exportada como número) --
+    depois de limpar as duas, o resultado é idêntico e o cruzamento por CPF
+    funciona independente de qual das duas formas cada base usa.
 
     Regras aplicadas, na ordem:
 
     1. Converte qualquer entrada para string (aceita números, floats como
-       ``123.0`` vindos de leitura mal tipada de Excel, etc.).
+       ``123.0`` vindos de leitura mal tipada de Excel, etc., e também
+       notação científica tipo ``"1.23456789E9"``, que pode aparecer em CSV
+       exportado de planilha quando a coluna vira número e o número é
+       grande).
     2. Remove tudo que não for dígito (pontos, traços, espaços, letras).
-    3. Preenche com zeros à esquerda até completar 11 dígitos (``zfill``).
+    3. Preenche com zeros à esquerda até completar 11 dígitos (``zfill``)
+       -- é este passo que resolve o caso de uma base ter o CPF sem o(s)
+       zero(s) à esquerda que a outra base preservou.
     4. Invalida (retorna nulo) CPFs formados inteiramente por zeros.
     5. Proteção extra (além do pedido original): se depois da limpeza
        sobrarem *mais* de 11 dígitos, o valor claramente não é um CPF
@@ -87,8 +98,23 @@ def limpar_cpf(coluna: pl.Series | pl.Expr) -> pl.Series | pl.Expr:
     """
 
     def construir(expr: pl.Expr) -> pl.Expr:
+        bruto = expr.cast(pl.Utf8, strict=False)
+
+        # Notação científica (ex.: "1.23456789E9"): se deixássemos cair
+        # direto no passo de remover não-dígitos, o "." e o "E" seriam
+        # descartados e os dígitos da mantissa e do expoente se
+        # misturariam, formando um número errado em vez de rejeitar ou
+        # interpretar corretamente. Por isso, quando a entrada bate com
+        # esse formato, primeiro convertemos para número e formatamos de
+        # volta como inteiro (sem parte decimal, sem expoente) antes de
+        # seguir com a limpeza normal.
+        eh_cientifica = bruto.str.contains(r"(?i)^-?\d+(\.\d+)?e[+-]?\d+$")
+        bruto_resolvido = pl.when(eh_cientifica).then(
+            bruto.cast(pl.Float64, strict=False).cast(pl.Int64, strict=False).cast(pl.Utf8, strict=False)
+        ).otherwise(bruto)
+
         texto = (
-            expr.cast(pl.Utf8, strict=False)
+            bruto_resolvido
             .str.replace_all(r"\.0$", "")  # ex.: "123456789.0" -> "123456789"
             .str.replace_all(r"[^0-9]", "")
         )
@@ -235,3 +261,24 @@ if __name__ == "__main__":
 
     with pl.Config(tbl_cols=-1, tbl_width_chars=140, fmt_str_lengths=40):
         print(resultado)
+
+    # Duas bases representando o MESMO CPF de formas diferentes (uma
+    # pontuada e já com zero à esquerda, outra só com os dígitos e sem
+    # zero à esquerda -- ex.: coluna lida/exportada como número) têm que
+    # limpar para o mesmo valor -- é isso que permite cruzar SGP x SIGEDUC
+    # por CPF mesmo quando as duas planilhas formatam o campo diferente.
+    cpf_pontuado = limpar_cpf(pl.Series(["012.345.678-99"])).to_list()[0]
+    cpf_numero_sem_zero = limpar_cpf(pl.Series([1234567899])).to_list()[0]
+    assert cpf_pontuado == cpf_numero_sem_zero == "01234567899", (
+        cpf_pontuado, cpf_numero_sem_zero
+    )
+
+    # Notação científica (CSV mal exportado de planilha, ex.: coluna virou
+    # número e o número é grande) também tem que resolver pro mesmo CPF.
+    cpf_cientifica = limpar_cpf(pl.Series(["1.234567899E9"])).to_list()[0]
+    assert cpf_cientifica == "01234567899", cpf_cientifica
+
+    print(
+        "\nOK: auto-teste de higienizacao.py passou (inclui tolerância a "
+        "CPF pontuado/número puro/notação científica, todos pro mesmo valor)."
+    )

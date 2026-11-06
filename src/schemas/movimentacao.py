@@ -13,7 +13,9 @@ class RelatorioMovimentacao(BaseModel):
     Cobre os dois relatórios devolvidos por `reconciliar_sgp_sigeduc`:
 
     - **Cadastro** (`total_cadastro`): CPFs que aparecem no SIGEDUC mas
-      ainda não existem na base SGP -- candidatos a novo cadastro.
+      ainda não existem na base SGP -- candidatos a novo cadastro. Se uma
+      planilha de Terços for enviada, `ESTUDANTE_ANO_PERIODO` sai
+      preenchida por CPF (ver `coluna_cpf_terco`/`total_cadastro_sem_terco`).
     - **Movimentação**: CPFs que já existem na base SGP, classificados
       conforme o que o SIGEDUC mostra sobre eles hoje. `total_sgp` se
       divide em `total_trans_escola` + `total_trans_mod` +
@@ -37,6 +39,14 @@ class RelatorioMovimentacao(BaseModel):
     coluna_data_matricula_sigeduc: str
     coluna_oferta_sigeduc: str
     coluna_serie_sigeduc: str
+    coluna_cpf_terco: str | None = Field(
+        default=None,
+        description="Coluna de CPF da planilha opcional de Terços. None se essa planilha não "
+        "foi enviada -- nesse caso ESTUDANTE_ANO_PERIODO sai em branco no Cadastro.",
+    )
+    coluna_ano_periodo_terco: str | None = Field(
+        default=None, description="Coluna de ano/período (terço) da planilha opcional de Terços. Ver coluna_cpf_terco."
+    )
 
     total_sgp: int = Field(ge=0, description="Linhas na base SGP enviada.")
     total_sgp_cpf_valido: int = Field(ge=0)
@@ -45,6 +55,11 @@ class RelatorioMovimentacao(BaseModel):
 
     total_cadastro: int = Field(
         ge=0, description="CPFs do SIGEDUC que ainda não estão na base SGP -- candidatos a novo cadastro."
+    )
+    total_cadastro_sem_terco: int = Field(
+        ge=0,
+        description="CPFs do Cadastro sem correspondência na planilha de Terços -- 0 quando essa "
+        "planilha não foi enviada (coluna_cpf_terco is None) ou quando todo mundo bateu.",
     )
 
     total_sgp_sem_correspondencia_sigeduc: int = Field(

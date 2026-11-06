@@ -58,7 +58,9 @@ src/
 │   ├── frequencia.py        # Módulo D — cálculo de frequência
 │   ├── exportacao.py        # Módulo E — exportação padrão MEC
 │   ├── situacao_aluno.py    # Módulo F — situação de matrícula e aprovações (com base de destino)
-│   └── situacao_sigeduc.py  # Módulo G — situação de matrícula direto do SIGEDUC (sem base de destino)
+│   ├── situacao_sigeduc.py  # Módulo G — situação de matrícula direto do SIGEDUC (sem base de destino)
+│   ├── comparacao_situacao.py  # Módulo H — divergências de situação SIGEDUC × SGP
+│   └── comparacao_serie.py     # Módulo I — divergências de série/ano SIGEDUC × SGP
 ├── schemas/              # Modelos Pydantic (validação de entrada/saída)
 ├── ui/                    # Componentes visuais reutilizáveis (upload, botões de download)
 └── utils/                 # Funções de higienização (CPF, texto) usadas em todo o sistema
@@ -71,13 +73,15 @@ A navegação (menu lateral) tem os seguintes módulos:
 | Módulo | O que faz |
 |---|---|
 | 🏠 Início | Teste rápido do ambiente — upload de planilha para conferir leitura, Polars, DuckDB e higienização |
-| 🔁 A. Deduplicação e Matrícula Mais Recente | Mantém 1 registro por CPF (o mais recente) |
+| 🔁 A. Deduplicação e Matrícula Mais Recente | Mantém 1 registro por CPF pela data de referência mais recente: encerramento da linha ou, se vazio, atualização do cadastro. Em empate, prefere encerramento. Sem ambas, prefere data de alocação, depois matrícula mais recente e alocação mais recente em empate. As colunas de data são selecionáveis. |
 | 🎓 B. Motor de Etapa de Ensino | Calcula `ESTUDANTE_ETAPA_DE_ENSINO` a partir de Oferta + Série |
 | 🔀 C. Discrepâncias e Movimentação | Cruza a base SGP atual com uma ou mais planilhas do SIGEDUC e gera dois relatórios: **Cadastro** (CPFs do SIGEDUC ainda não cadastrados no SGP, já formatados nas 24 colunas oficiais) e **Movimentação** (CPFs já cadastrados, classificados em `trans. escola`, `trans. mod` ou `cancelado` conforme o que o SIGEDUC mostra hoje) |
 | 📅 D. Cálculo de Frequência | Cruza base SGP com base SIGEDUC e corrige a frequência |
 | 📤 E. Exportação Padrão MEC | Força o layout oficial de colunas para reenvio ao SGP |
 | ✅ F. Situação de Matrícula e Aprovações | Cruza base SIGEDUC com a base de destino (Pé de Meia/SGP) e preenche situação mais recente, datas e contagem de módulos aprovados por CPF |
 | 📥 G. Situação de Matrícula (Somente SIGEDUC) | Gera a situação mais recente + contagem de módulos aprovados direto do SIGEDUC (linha completa por CPF), sem cruzar com nenhuma base de destino |
+| 🔎 H. Comparar Situação SIGEDUC × SGP | Seleciona CPF, data e situação em cada planilha, além da série/ano no SIGEDUC; compara apenas matrículas com CPF **e data de matrícula iguais** nas duas bases e exibe situações divergentes. O XLSX preserva todas as colunas do SGP e acrescenta as informações da comparação ao final. `APROVADO` no 3º/4º ano corresponde ao código 11. |
+| 📚 I. Comparar Série/Ano SIGEDUC × SGP | Cruza os CPFs das duas bases e compara as colunas de série/ano selecionadas. Datas de matrícula opcionais resolvem CPFs repetidos. Mostra apenas séries diferentes e exporta XLSX com todas as colunas do SGP, CPF normalizado e as duas séries ao final. |
 
 Cada módulo valida as colunas recebidas e mostra um erro claro se alguma estiver faltando.
 

@@ -8,7 +8,11 @@ dois relatórios:
 
     - **Cadastro** (`df_cadastro`): CPFs que aparecem no SIGEDUC mas ainda
       não existem na base SGP -- formatados prontos no layout oficial de
-      cadastro do SGP (24 colunas), para importar como aluno novo.
+      cadastro do SGP (24 colunas), para importar como aluno novo, mais
+      uma 25ª coluna extra (`SITUACAO_ALUNO`, fora do layout oficial) com
+      a situação de matrícula mais recente no SIGEDUC, só para conferência.
+      `ESTUDANTE_ANO_PERIODO` (terço do EJA) sai preenchida quando uma
+      planilha opcional de Terços é enviada (cruzada por CPF).
     - **Movimentação** (`df_movimentacao`): só os CPFs da base SGP que
       tiveram `'trans. escola'` ou `'trans. mod'`, já classificados em
       `MATRICULA_SITUACAO_FINAL` com `DATA_FIM_OU_APROVACAO` preenchida.
@@ -91,6 +95,11 @@ COLUNAS_DATA_ATUALIZACAO_SIGEDUC_CANDIDATAS = (
 )
 COLUNAS_DATA_MATRICULA_SIGEDUC_CANDIDATAS = ("DATA MATRÍCULA", "DATA MATRICULA")
 
+# --- Planilha opcional de Terços (SIGEDUC) -- só CPF + ano/período do EJA,
+# cruzada exclusivamente para preencher ESTUDANTE_ANO_PERIODO no Cadastro.
+COLUNAS_CPF_TERCO_CANDIDATAS = ("ESTUDANTE_CPF", "CPF", "NU CPF")
+COLUNAS_ANO_PERIODO_TERCO_CANDIDATAS = ("ESTUDANTE_ANO_PERIODO", "ANO_PERIODO", "ANO PERÍODO", "ANO PERIODO", "TERÇO", "TERCO")
+
 # --- Colunas só usadas para formatar o relatório de Cadastro -- sempre
 # detectadas automaticamente (sem parâmetro dedicado: são muitas, e nenhuma
 # delas afeta o cruzamento em si). Ausente na planilha enviada = fica "".
@@ -151,6 +160,11 @@ COLUNAS_CADASTRO_FINAIS = (
     "DATA_INICIO_PERIODO_LETIVO",
     "TURMA_LOCALIZACAO",
 )
+
+# Coluna extra do relatório de Cadastro, fora do layout oficial das 24
+# acima -- situação de matrícula do SIGEDUC, só para conferência antes de
+# importar (pedida à parte pelo usuário).
+COLUNA_CADASTRO_SITUACAO_EXTRA = "SITUACAO_ALUNO"
 
 
 def _normalizar_entidade(coluna: pl.Expr) -> pl.Expr:
@@ -253,11 +267,19 @@ def _expr_modalidade_ensino(oferta_upper: pl.Expr) -> pl.Expr:
     )
 
 
-def _montar_cadastro(sigeduc_novos: pl.DataFrame, coluna_cpf: str, coluna_censo: str) -> pl.DataFrame:
+def _montar_cadastro(
+    sigeduc_novos: pl.DataFrame, coluna_cpf: str, coluna_censo: str, coluna_situacao: str
+) -> pl.DataFrame:
     """Formata `sigeduc_novos` (já deduplicado, 1 linha por CPF) no layout
     oficial de cadastro do SGP -- réplica das 24 regras do script legado de
     Cadastro, com a diferença de que cada coluna de origem é localizada de
-    forma tolerante a acento/espaço/caixa em vez de nome exato."""
+    forma tolerante a acento/espaço/caixa em vez de nome exato. Acrescenta
+    uma 25ª coluna (`COLUNA_CADASTRO_SITUACAO_EXTRA`), fora do layout
+    oficial, com a situação de matrícula do SIGEDUC -- só para conferência,
+    a pedido do usuário. `ESTUDANTE_ANO_PERIODO` (terço do EJA) sai
+    preenchido quando `sigeduc_novos` já chega com a coluna auxiliar
+    `_ano_periodo_terco` (join feito em `reconciliar_sgp_sigeduc` com a
+    planilha opcional de Terços); senão fica "" como no script legado."""
     resp = _valor_ou_vazio(sigeduc_novos, COLUNAS_RESPONSAVEL_CANDIDATAS)
     pai = _valor_ou_vazio(sigeduc_novos, COLUNAS_PAI_CANDIDATAS).str.to_uppercase().str.strip_chars()
     mae = _valor_ou_vazio(sigeduc_novos, COLUNAS_MAE_CANDIDATAS).str.to_uppercase().str.strip_chars()
@@ -268,6 +290,14 @@ def _montar_cadastro(sigeduc_novos: pl.DataFrame, coluna_cpf: str, coluna_censo:
     mun_uf = _valor_ou_vazio(sigeduc_novos, COLUNAS_MUNICIPIO_UF_CANDIDATAS)
     turno_upper = _valor_ou_vazio(sigeduc_novos, COLUNAS_TURNO_CANDIDATAS).str.to_uppercase()
     oferta_upper = _valor_ou_vazio(sigeduc_novos, COLUNAS_OFERTA_CANDIDATAS).str.to_uppercase()
+    # `_ano_periodo_terco` só existe quando uma planilha de Terços foi
+    # cruzada em `reconciliar_sgp_sigeduc` (join deixado pronto antes de
+    # chamar esta função) -- sem ela, mantém o "" do script legado.
+    ano_periodo = (
+        pl.col("_ano_periodo_terco").cast(pl.Utf8, strict=False).fill_null("")
+        if "_ano_periodo_terco" in sigeduc_novos.columns
+        else pl.lit("")
+    )
 
     resultado = sigeduc_novos.select(
         pl.col(coluna_cpf).alias("ESTUDANTE_CPF"),
@@ -300,14 +330,17 @@ def _montar_cadastro(sigeduc_novos: pl.DataFrame, coluna_cpf: str, coluna_censo:
         .then(pl.lit("1"))
         .otherwise(pl.lit("0"))
         .alias("ESTUDANTE_MATRICULA_INTEGRAL"),
-        pl.lit("").alias("ESTUDANTE_ANO_PERIODO"),
+        ano_periodo.alias("ESTUDANTE_ANO_PERIODO"),
         _expr_modalidade_ensino(oferta_upper).alias("MODALIDADE_ENSINO_ESTUDANTE"),
         converter_data_robusta(_valor_ou_vazio(sigeduc_novos, COLUNAS_DATA_INICIO_PERIODO_CANDIDATAS)).alias(
             "DATA_INICIO_PERIODO_LETIVO"
         ),
         pl.lit("1").alias("TURMA_LOCALIZACAO"),
+        pl.col(coluna_situacao).cast(pl.Utf8, strict=False).str.strip_chars().fill_null("").alias(
+            COLUNA_CADASTRO_SITUACAO_EXTRA
+        ),
     )
-    return resultado.select(list(COLUNAS_CADASTRO_FINAIS)).sort("ESTUDANTE_CPF")
+    return resultado.select(list(COLUNAS_CADASTRO_FINAIS) + [COLUNA_CADASTRO_SITUACAO_EXTRA]).sort("ESTUDANTE_CPF")
 
 
 def reconciliar_sgp_sigeduc(
@@ -323,6 +356,9 @@ def reconciliar_sgp_sigeduc(
     coluna_data_matricula_sigeduc: str | None = None,
     coluna_oferta_sigeduc: str | None = None,
     coluna_serie_sigeduc: str | None = None,
+    df_tercos: pl.DataFrame | None = None,
+    coluna_cpf_terco: str | None = None,
+    coluna_ano_periodo_terco: str | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, RelatorioMovimentacao]:
     """Reconcilia a base SGP atual com o SIGEDUC: quem falta cadastrar e
     quem já cadastrado se movimentou.
@@ -346,6 +382,18 @@ def reconciliar_sgp_sigeduc(
         data de nascimento, sexo, raça/cor, responsável, etc.) são sempre
         detectadas automaticamente, sem parâmetro dedicado -- ausentes na
         planilha enviada, ficam em branco no cadastro gerado.
+    df_tercos:
+        Planilha **opcional** e à parte do SIGEDUC principal, só com CPF e
+        o terço/ano-período do EJA (`ESTUDANTE_CPF`/`ESTUDANTE_ANO_PERIODO`
+        no export típico). Cruzada por CPF exclusivamente para preencher
+        `ESTUDANTE_ANO_PERIODO` no Cadastro -- não participa do
+        cruzamento SGP x SIGEDUC nem da classificação de Movimentação. Se
+        omitida, `ESTUDANTE_ANO_PERIODO` sai "" (mesmo comportamento de
+        antes desse parâmetro existir).
+    coluna_cpf_terco, coluna_ano_periodo_terco:
+        Nomes das colunas de `df_tercos`. Se omitidas (e `df_tercos` for
+        passada), tenta detectar automaticamente. Ignoradas se `df_tercos`
+        for `None`.
 
     Returns
     -------
@@ -354,7 +402,11 @@ def reconciliar_sgp_sigeduc(
 
         - `df_cadastro`: CPFs do SIGEDUC ausentes do SGP, já deduplicados
           (prioriza situação `MATRICULADO`, depois a Data Matrícula mais
-          recente) e formatados nas 24 colunas oficiais de cadastro.
+          recente) e formatados nas 24 colunas oficiais de cadastro
+          (`ESTUDANTE_ANO_PERIODO` vem de `df_tercos`, cruzado por CPF,
+          quando essa planilha é enviada), mais a coluna extra
+          `SITUACAO_ALUNO` (situação de matrícula no SIGEDUC, fora do
+          layout oficial, só informativa).
         - `df_movimentacao`: só os CPFs da base SGP com `'trans. escola'`
           ou `'trans. mod'`, com `MATRICULA_SITUACAO_FINAL` e
           `DATA_FIM_OU_APROVACAO` preenchidas. Quem não teve nenhuma
@@ -458,7 +510,38 @@ def reconciliar_sgp_sigeduc(
         subset=[coluna_cpf_sigeduc_r], keep="first", maintain_order=True
     )
 
-    df_cadastro = _montar_cadastro(sigeduc_novos_dedup, coluna_cpf_sigeduc_r, coluna_censo_sigeduc_r)
+    # --- Planilha opcional de Terços: cruzada só por CPF, só para
+    # preencher ESTUDANTE_ANO_PERIODO no Cadastro -- não afeta o
+    # cruzamento SGP x SIGEDUC nem a Movimentação. ---
+    if df_tercos is not None:
+        coluna_cpf_terco_r = coluna_cpf_terco or exigir_coluna(df_tercos, COLUNAS_CPF_TERCO_CANDIDATAS, "CPF (Terços)")
+        coluna_ano_periodo_terco_r = coluna_ano_periodo_terco or exigir_coluna(
+            df_tercos, COLUNAS_ANO_PERIODO_TERCO_CANDIDATAS, "Ano/Período (Terços)"
+        )
+        tercos = (
+            df_tercos.select(
+                limpar_cpf(pl.col(coluna_cpf_terco_r)).alias(coluna_cpf_sigeduc_r),
+                pl.col(coluna_ano_periodo_terco_r)
+                .cast(pl.Utf8, strict=False)
+                .str.strip_chars()
+                .alias("_ano_periodo_terco"),
+            )
+            .filter(pl.col(coluna_cpf_sigeduc_r).is_not_null())
+            # Se o CPF se repetir na planilha de Terços, fica só com a
+            # última ocorrência -- mesma tolerância usada nas outras
+            # planilhas auxiliares do projeto.
+            .unique(subset=[coluna_cpf_sigeduc_r], keep="last", maintain_order=True)
+        )
+        sigeduc_novos_dedup = sigeduc_novos_dedup.join(tercos, on=coluna_cpf_sigeduc_r, how="left")
+        total_cadastro_sem_terco = int(sigeduc_novos_dedup["_ano_periodo_terco"].is_null().sum())
+    else:
+        coluna_cpf_terco_r = None
+        coluna_ano_periodo_terco_r = None
+        total_cadastro_sem_terco = 0
+
+    df_cadastro = _montar_cadastro(
+        sigeduc_novos_dedup, coluna_cpf_sigeduc_r, coluna_censo_sigeduc_r, coluna_situacao_sigeduc_r
+    )
     total_cadastro = df_cadastro.height
 
     # =========================================================
@@ -580,11 +663,14 @@ def reconciliar_sgp_sigeduc(
         coluna_data_matricula_sigeduc=coluna_data_matricula_sigeduc_r,
         coluna_oferta_sigeduc=coluna_oferta_sigeduc_r,
         coluna_serie_sigeduc=coluna_serie_sigeduc_r,
+        coluna_cpf_terco=coluna_cpf_terco_r,
+        coluna_ano_periodo_terco=coluna_ano_periodo_terco_r,
         total_sgp=total_sgp,
         total_sgp_cpf_valido=total_sgp_cpf_valido,
         total_sigeduc=total_sigeduc,
         total_sigeduc_cpf_valido=total_sigeduc_cpf_valido,
         total_cadastro=total_cadastro,
+        total_cadastro_sem_terco=total_cadastro_sem_terco,
         total_sgp_sem_correspondencia_sigeduc=total_sgp_sem_correspondencia,
         total_trans_escola=total_trans_escola,
         total_trans_mod=total_trans_mod,
@@ -709,5 +795,36 @@ if __name__ == "__main__":
     assert linha_cad["ESTUDANTE_RACA_COR"] == "3"  # PARDA -> 3
     assert linha_cad["CO_ENTIDADE"] == "300"
     assert linha_cad["ESTUDANTE_ETAPA_DE_ENSINO"] == "25"  # Regular, 1ª série
+    assert linha_cad["SITUACAO_ALUNO"] == "MATRICULADO"  # coluna extra, fora do layout oficial
+
+    # Sem planilha de Terços (comportamento padrão, sem o parâmetro):
+    # ESTUDANTE_ANO_PERIODO fica "" e o relatório mostra que a planilha
+    # não foi usada (coluna_cpf_terco is None).
+    assert linha_cad["ESTUDANTE_ANO_PERIODO"] == ""
+    assert relatorio.coluna_cpf_terco is None
+    assert relatorio.total_cadastro_sem_terco == 0
+
+    # Com planilha de Terços, CPF 6 encontrado -> ESTUDANTE_ANO_PERIODO
+    # preenchido.
+    tercos = pl.DataFrame(
+        {
+            "ESTUDANTE_CPF": ["6", "999"],  # 999 não existe em nenhuma base -- só ruído
+            "ESTUDANTE_ANO_PERIODO": ["2º TERÇO", "1º TERÇO"],
+        }
+    )
+    df_cadastro_com_terco, _, relatorio_com_terco = reconciliar_sgp_sigeduc(sgp, sigeduc, df_tercos=tercos)
+    linha_cad_terco = df_cadastro_com_terco.row(0, named=True)
+    assert linha_cad_terco["ESTUDANTE_ANO_PERIODO"] == "2º TERÇO"
+    assert relatorio_com_terco.coluna_cpf_terco is not None
+    assert relatorio_com_terco.total_cadastro_sem_terco == 0
+
+    # Com planilha de Terços, mas SEM o CPF 6 nela -> fica "" mesmo assim
+    # (não quebra), e o relatório aponta 1 CPF do Cadastro sem terço.
+    tercos_sem_match = pl.DataFrame({"ESTUDANTE_CPF": ["999"], "ESTUDANTE_ANO_PERIODO": ["1º TERÇO"]})
+    df_cadastro_sem_match, _, relatorio_sem_match = reconciliar_sgp_sigeduc(sgp, sigeduc, df_tercos=tercos_sem_match)
+    linha_cad_sem_match = df_cadastro_sem_match.row(0, named=True)
+    assert linha_cad_sem_match["ESTUDANTE_ANO_PERIODO"] == ""
+    assert relatorio_sem_match.coluna_cpf_terco is not None
+    assert relatorio_sem_match.total_cadastro_sem_terco == 1
 
     print("\nOK: auto-teste do Módulo C (reconciliação SGP x SIGEDUC) passou.")

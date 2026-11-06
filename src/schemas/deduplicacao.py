@@ -16,9 +16,11 @@ class RelatorioDeduplicacao(BaseModel):
 
     coluna_cpf: str
     coluna_data: str = Field(
-        description="Coluna de data efetivamente usada para decidir qual "
-        "matrícula é 'a mais recente' de cada CPF."
+        description="Coluna da data de matrícula usada na ordenação."
     )
+    coluna_data_encerramento: str | None
+    coluna_data_atualizacao: str | None
+    coluna_data_alocacao: str
     total_registros_recebidos: int = Field(ge=0)
     total_cpf_invalido_removido: int = Field(
         ge=0,
@@ -32,8 +34,6 @@ class RelatorioDeduplicacao(BaseModel):
     )
     total_data_invalida_mantida: int = Field(
         ge=0,
-        description="Quantos registros do resultado final ficaram com data "
-        "não reconhecida (mantidos mesmo assim, para não sumir com o "
-        "aluno -- mas vale conferir manualmente).",
+        description="Registros selecionados sem matrícula, encerramento, atualização ou alocação reconhecidos.",
     )
     total_registros_final: int = Field(ge=0)
