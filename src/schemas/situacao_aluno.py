@@ -20,9 +20,8 @@ class RelatorioSituacaoAluno(BaseModel):
     coluna_cpf_destino: str
     coluna_data_fim: str
     coluna_data_encerramento: str = Field(
-        description="Coluna usada para decidir qual registro é a 'situação "
-        "mais recente' de cada CPF (prioriza data real; sem nenhuma data "
-        "válida, mantém o último registro na ordem original da planilha)."
+        description="Coluna usada para desempatar registros do SIGEDUC com "
+        "o mesmo CPF e a mesma data de matrícula."
     )
     coluna_periodo: str
     coluna_situacao: str
@@ -53,16 +52,16 @@ class RelatorioSituacaoAluno(BaseModel):
 
     total_sigeduc: int = Field(ge=0, description="Linhas na planilha do SIGEDUC, como enviada.")
     total_sigeduc_apos_limpeza: int = Field(
-        ge=0, description="Linhas do SIGEDUC após remover CPF inválido -- é essa base que é usada no cruzamento."
+        ge=0, description="Pares distintos de CPF e data de matrícula válidos no SIGEDUC."
     )
     total_destino: int = Field(ge=0, description="Linhas na planilha de destino, como enviada.")
 
     total_com_correspondencia_sigeduc: int = Field(
-        ge=0, description="CPFs do destino encontrados na base SIGEDUC (tiveram algum registro)."
+        ge=0, description="Linhas do destino com CPF e data de matrícula encontrados no SIGEDUC."
     )
     total_sem_correspondencia_sigeduc: int = Field(
         ge=0,
-        description="CPFs do destino não encontrados no SIGEDUC enviado -- "
+        description="Linhas do destino sem CPF e data de matrícula encontrados no SIGEDUC -- "
         "esses registros mantêm os valores que já tinham no destino, "
         "exceto QTD_MODULOS_APROVADOS, que fica 0.",
     )

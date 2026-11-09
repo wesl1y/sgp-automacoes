@@ -1,19 +1,19 @@
 """Módulo F: Situação de Matrícula e Aprovações (SIGEDUC -> Pé de Meia).
 
-Cruza uma base **bruta do SIGEDUC** (um registro por matrícula/período do
-aluno, com a situação daquela matrícula) com a base de **destino** (Pé de
-Meia/SGP a atualizar) pelo CPF, e devolve o destino com 5 colunas
-preenchidas a partir da situação mais recente de cada aluno:
+Cruza uma base **bruta do SIGEDUC** com a base de **destino** pela
+combinação de CPF e data de matrícula. A situação principal vem da
+matrícula correspondente; a matrícula posterior mais recente aparece
+em duas colunas adicionais:
 
-    - `DATA_FIM_OU_APROVACAO`        <- `DATA FIM` do registro mais recente.
-    - `DATA_CONCLUSAO_ENSINO_MEDIO`  <- `DATA ENCERRAMENTO` do registro mais
-      recente (é também o critério usado para decidir qual registro é "o
-      mais recente" -- ver `_resumir_por_cpf` abaixo).
-    - `PERIODO`                      <- `PERÍODO` do registro mais recente.
+    - `DATA_FIM_OU_APROVACAO`        <- `DATA FIM` da matrícula correspondente.
+    - `DATA_CONCLUSAO_ENSINO_MEDIO`  <- `DATA ENCERRAMENTO` dessa matrícula.
+    - `PERIODO`                      <- `PERÍODO` dessa matrícula.
     - `SITUACAO_MATRICULA_RECENTE`   <- `SITUAÇÃO MATRÍCULA` do registro
-      mais recente.
+      correspondente (nome legado da coluna).
     - `QTD_MODULOS_APROVADOS`        <- quantas linhas *daquele CPF* (não só
-      a mais recente) têm situação contendo `status_aprovado`.
+      a matrícula correspondente) têm situação contendo `status_aprovado`.
+    - `DATA_MATRICULA_POSTERIOR_SIGEDUC` e
+      `SITUACAO_MATRICULA_POSTERIOR_SIGEDUC` <- última matrícula posterior.
 
 Um CPF do destino que não aparece no SIGEDUC enviado mantém os valores que
 já tinha (exceto `QTD_MODULOS_APROVADOS`, que fica 0) -- nenhuma linha do
@@ -23,20 +23,19 @@ Duas checagens opcionais (replicam as duas variações mais recentes do
 script legado `GERANDO_APROVADOS`, ligadas por padrão como no notebook):
 
     - **Transferência Externa** (`aplicar_transferencia_externa`): um CPF
-      cuja situação mais recente é `'TRANSFERIDO'` e que, em todo o
+      cuja situação da matrícula correspondente é `'TRANSFERIDO'` e que, em todo o
       histórico do SIGEDUC enviado, nunca teve nenhuma outra situação, é
       reclassificado para `'TRANSFERÊNCIA EXTERNA'` -- ele nunca chegou a
       ter uma matrícula própria aqui, só existe por já ter vindo
       transferido de outra rede/escola.
     - **Divergência de Censo** (`aplicar_checagem_censo`): compara o código
-      de Censo/INEP do SIGEDUC com o `CO_ENTIDADE` do destino; quem
+      de Censo/INEP da matrícula correspondente com o `CO_ENTIDADE` do destino; quem
       divergir é **removido** de `df_atualizado` e devolvido à parte em
       `df_divergentes`, para conferência manual antes de decidir o que
       fazer com esses alunos.
 
-Implementado com Polars para a parte de "uma linha por CPF, priorizando
-data real" (mesmo padrão do Módulo A) e DuckDB para o cruzamento final com
-o destino (mesmo padrão dos Módulos C/D).
+Implementado com Polars para escolher uma linha por CPF e matrícula e
+DuckDB para o cruzamento final com o destino.
 
 As funções que só olham para o SIGEDUC (`preparar_sigeduc`,
 `contar_aprovados`, `situacao_mais_recente`,
@@ -58,6 +57,8 @@ COLUNAS_CPF_SIGEDUC_CANDIDATAS = ("NU CPF", "ESTUDANTE_CPF", "ALUNO_CPF", "CPF")
 COLUNAS_CPF_DESTINO_CANDIDATAS = ("ESTUDANTE_CPF", "CPF")
 COLUNAS_DATA_FIM_CANDIDATAS = ("DATA FIM",)
 COLUNAS_DATA_ENCERRAMENTO_CANDIDATAS = ("DATA ENCERRAMENTO",)
+COLUNAS_DATA_MATRICULA_SIGEDUC_CANDIDATAS = ("DATA MATRÍCULA", "DATA MATRICULA", "DATA_MATRICULA", "DT_MATRICULA")
+COLUNAS_DATA_MATRICULA_DESTINO_CANDIDATAS = ("DATA_MATRICULA", "DATA MATRÍCULA", "DATA MATRICULA", "DT_MATRICULA", "ESTUDANTE_DATA_MATRICULA")
 COLUNAS_PERIODO_CANDIDATAS = ("PERÍODO", "PERIODO")
 COLUNAS_SITUACAO_CANDIDATAS = ("SITUACAO MATRÍCULA", "SITUAÇÃO MATRÍCULA", "SITUACAO_MATRICULA", "SITUAÇÃO_MATRÍCULA")
 COLUNAS_CENSO_CANDIDATAS = ("CENSO",)
@@ -71,6 +72,8 @@ COLUNA_DESTINO_DATA_CONCLUSAO = "DATA_CONCLUSAO_ENSINO_MEDIO"
 COLUNA_DESTINO_PERIODO = "PERIODO"
 COLUNA_DESTINO_SITUACAO = "SITUACAO_MATRICULA_RECENTE"
 COLUNA_DESTINO_QTD_APROVADOS = "QTD_MODULOS_APROVADOS"
+COLUNA_DESTINO_MATRICULA_POSTERIOR = "DATA_MATRICULA_POSTERIOR_SIGEDUC"
+COLUNA_DESTINO_SITUACAO_POSTERIOR = "SITUACAO_MATRICULA_POSTERIOR_SIGEDUC"
 
 COLUNAS_DESTINO_GERADAS = (
     COLUNA_DESTINO_DATA_FIM,
@@ -78,6 +81,8 @@ COLUNAS_DESTINO_GERADAS = (
     COLUNA_DESTINO_PERIODO,
     COLUNA_DESTINO_SITUACAO,
     COLUNA_DESTINO_QTD_APROVADOS,
+    COLUNA_DESTINO_MATRICULA_POSTERIOR,
+    COLUNA_DESTINO_SITUACAO_POSTERIOR,
 )
 
 # Texto (case-insensitive) usado por padrão para contar "módulo aprovado".
@@ -88,6 +93,13 @@ STATUS_APROVADO_PADRAO = "APROVADO EM MÓDULO"
 
 _SITUACAO_TRANSFERIDO = "TRANSFERIDO"
 SITUACAO_TRANSFERENCIA_EXTERNA = "TRANSFERÊNCIA EXTERNA"
+
+
+def _data_matricula_normalizada(coluna: str) -> pl.Expr:
+    return converter_data_robusta(
+        pl.col(coluna).cast(pl.Utf8, strict=False)
+        .str.strip_chars().str.replace(r"^['’]+\s*", "")
+    ).str.to_date("%d/%m/%Y", strict=False)
 
 
 def preparar_sigeduc(df: pl.DataFrame, coluna_cpf: str, coluna_data_fim: str, coluna_data_encerramento: str) -> pl.DataFrame:
@@ -232,6 +244,68 @@ def _resumir_por_cpf(
     return resumo, total_reclassificados
 
 
+def _resumir_por_matricula(
+    df_sigeduc: pl.DataFrame,
+    coluna_cpf: str,
+    coluna_matricula: str,
+    coluna_data_fim: str,
+    coluna_data_encerramento: str,
+    coluna_periodo: str,
+    coluna_situacao: str,
+    aplicar_transferencia_externa: bool,
+    coluna_censo: str | None,
+) -> tuple[pl.DataFrame, int]:
+    """Uma situação por CPF e matrícula, com a última matrícula posterior em anexo."""
+    sigeduc = (
+        preparar_sigeduc(df_sigeduc, coluna_cpf, coluna_data_fim, coluna_data_encerramento)
+        .with_row_index("_ordem_original")
+        .with_columns(
+            _data_matricula_normalizada(coluna_matricula).alias("_matricula_data")
+        )
+    )
+    com_data = sigeduc.filter(pl.col("_matricula_data").is_not_null())
+    ordenado = com_data.sort(
+        [coluna_cpf, "_matricula_data", "_data_ordenacao", "_ordem_original"],
+        nulls_last=False,
+    )
+    mesma_matricula = ordenado.unique(
+        subset=[coluna_cpf, "_matricula_data"], keep="last", maintain_order=True
+    )
+    ultima_matricula = ordenado.unique(subset=[coluna_cpf], keep="last").select(
+        coluna_cpf,
+        pl.col("_matricula_data").alias("_matricula_posterior_data"),
+        pl.col(coluna_situacao).alias("_situacao_posterior"),
+    )
+
+    total_reclassificados = 0
+    if aplicar_transferencia_externa:
+        mesma_matricula, total_reclassificados = reclassificar_transferencia_externa(
+            mesma_matricula, sigeduc, coluna_cpf, coluna_situacao
+        )
+        total_reclassificados = mesma_matricula.filter(
+            pl.col(coluna_situacao) == SITUACAO_TRANSFERENCIA_EXTERNA
+        ).select(coluna_cpf).n_unique()
+
+    colunas = [coluna_cpf, "_matricula_data", coluna_data_fim, coluna_data_encerramento,
+               coluna_periodo, coluna_situacao]
+    if coluna_censo is not None:
+        colunas.append(coluna_censo)
+    resumo = (
+        mesma_matricula.select(colunas)
+        .join(ultima_matricula, on=coluna_cpf, how="left")
+        .with_columns(
+            pl.when(pl.col("_matricula_posterior_data") > pl.col("_matricula_data"))
+            .then(pl.col("_matricula_posterior_data").dt.strftime("%d/%m/%Y"))
+            .otherwise(None).alias("_matricula_posterior"),
+            pl.when(pl.col("_matricula_posterior_data") > pl.col("_matricula_data"))
+            .then(pl.col("_situacao_posterior"))
+            .otherwise(None).alias("_situacao_posterior_validada"),
+        )
+        .drop("_matricula_posterior_data")
+    )
+    return resumo, total_reclassificados
+
+
 def _normalizar_codigo_entidade(coluna: pl.Expr) -> pl.Expr:
     """Remove espaços e um eventual '.0' de código de escola que virou
     float sem querer -- mesma normalização usada no Módulo C para
@@ -252,11 +326,15 @@ def _construir_sql_cruzamento(coluna_cpf_destino: str, incluir_censo: bool) -> s
             COALESCE(resumo._data_encerramento, destino.{quotar_identificador(COLUNA_DESTINO_DATA_CONCLUSAO)}) AS {quotar_identificador(COLUNA_DESTINO_DATA_CONCLUSAO)},
             COALESCE(resumo._periodo, destino.{quotar_identificador(COLUNA_DESTINO_PERIODO)}) AS {quotar_identificador(COLUNA_DESTINO_PERIODO)},
             COALESCE(resumo._situacao, destino.{quotar_identificador(COLUNA_DESTINO_SITUACAO)}) AS {quotar_identificador(COLUNA_DESTINO_SITUACAO)},
-            COALESCE(resumo._qtd_aprovados, 0) AS {quotar_identificador(COLUNA_DESTINO_QTD_APROVADOS)},
+            COALESCE(contagem._qtd_aprovados, 0) AS {quotar_identificador(COLUNA_DESTINO_QTD_APROVADOS)},
+            resumo._matricula_posterior AS {quotar_identificador(COLUNA_DESTINO_MATRICULA_POSTERIOR)},
+            resumo._situacao_posterior_validada AS {quotar_identificador(COLUNA_DESTINO_SITUACAO_POSTERIOR)},
             resumo._cpf IS NOT NULL AS _encontrado_sigeduc
             {censo_select}
         FROM destino
         LEFT JOIN resumo ON destino.{cpf_destino_sql} = resumo._cpf
+            AND destino._matricula_destino = resumo._matricula_data
+        LEFT JOIN contagem ON destino.{cpf_destino_sql} = contagem._cpf
     """
 
 
@@ -265,6 +343,8 @@ def calcular_situacao_aluno(
     df_destino: pl.DataFrame,
     coluna_cpf_sigeduc: str | None = None,
     coluna_cpf_destino: str | None = None,
+    coluna_data_matricula_sigeduc: str | None = None,
+    coluna_data_matricula_destino: str | None = None,
     coluna_data_fim: str | None = None,
     coluna_data_encerramento: str | None = None,
     coluna_periodo: str | None = None,
@@ -275,7 +355,7 @@ def calcular_situacao_aluno(
     coluna_censo: str | None = None,
     coluna_co_entidade: str | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, RelatorioSituacaoAluno]:
-    """Cruza `df_sigeduc` com `df_destino` pelo CPF e atualiza a situação.
+    """Cruza SIGEDUC e destino por CPF e data de matrícula.
 
     Parameters
     ----------
@@ -284,9 +364,10 @@ def calcular_situacao_aluno(
         situação daquela matrícula (`'SITUAÇÃO MATRÍCULA'`).
     df_destino:
         Base de destino a atualizar (Pé de Meia/SGP) -- precisa ter (pelo
-        menos) a coluna de CPF; as 5 colunas geradas são criadas vazias se
+        menos) CPF e data de matrícula; as colunas geradas são criadas vazias se
         ainda não existirem.
-    coluna_cpf_sigeduc, coluna_cpf_destino, coluna_data_fim,
+    coluna_cpf_sigeduc, coluna_cpf_destino, coluna_data_matricula_sigeduc,
+    coluna_data_matricula_destino, coluna_data_fim,
     coluna_data_encerramento, coluna_periodo, coluna_situacao:
         Nomes das colunas a usar em cada base. Se omitidos, tenta detectar
         automaticamente pelas variações mais comuns dos exports do
@@ -294,11 +375,11 @@ def calcular_situacao_aluno(
     status_aprovado:
         Texto (sem diferenciar maiúsculas/minúsculas) usado para contar
         `QTD_MODULOS_APROVADOS`: conta toda linha do SIGEDUC daquele CPF
-        cuja situação contenha esse texto -- não só a situação mais
-        recente. Default `'APROVADO EM MÓDULO'`.
+        cuja situação contenha esse texto -- não só a matrícula correspondente.
+        Default `'APROVADO EM MÓDULO'`.
     aplicar_transferencia_externa:
         Se True (padrão), reclassifica para `'TRANSFERÊNCIA EXTERNA'` todo
-        CPF cuja situação mais recente é `'TRANSFERIDO'` e que nunca teve
+        CPF cuja situação da matrícula correspondente é `'TRANSFERIDO'` e que nunca teve
         nenhuma outra situação no histórico do SIGEDUC enviado.
     aplicar_checagem_censo:
         Se True, compara o Censo/INEP do SIGEDUC com o CO_ENTIDADE do
@@ -316,7 +397,7 @@ def calcular_situacao_aluno(
         `(df_atualizado, df_divergentes, relatorio)`:
 
         - `df_atualizado`: o destino inteiro (menos os divergentes de
-          Censo, se essa checagem estiver ligada), com as 5 colunas
+        Censo, se essa checagem estiver ligada), com as colunas
           atualizadas -- pronto para reenvio.
         - `df_divergentes`: CPFs removidos por divergência de Censo x
           CO_ENTIDADE, para conferência manual. Sempre vazio (0 linhas) se
@@ -332,6 +413,12 @@ def calcular_situacao_aluno(
     """
     coluna_cpf_sigeduc_r = coluna_cpf_sigeduc or exigir_coluna(df_sigeduc, COLUNAS_CPF_SIGEDUC_CANDIDATAS, "CPF (base SIGEDUC)")
     coluna_cpf_destino_r = coluna_cpf_destino or exigir_coluna(df_destino, COLUNAS_CPF_DESTINO_CANDIDATAS, "CPF (base destino)")
+    coluna_data_matricula_sigeduc_r = coluna_data_matricula_sigeduc or exigir_coluna(
+        df_sigeduc, COLUNAS_DATA_MATRICULA_SIGEDUC_CANDIDATAS, "Data de Matrícula (SIGEDUC)"
+    )
+    coluna_data_matricula_destino_r = coluna_data_matricula_destino or exigir_coluna(
+        df_destino, COLUNAS_DATA_MATRICULA_DESTINO_CANDIDATAS, "Data de Matrícula (destino)"
+    )
     coluna_data_fim_r = coluna_data_fim or exigir_coluna(df_sigeduc, COLUNAS_DATA_FIM_CANDIDATAS, "Data Fim (SIGEDUC)")
     coluna_data_encerramento_r = coluna_data_encerramento or exigir_coluna(
         df_sigeduc, COLUNAS_DATA_ENCERRAMENTO_CANDIDATAS, "Data Encerramento (SIGEDUC)"
@@ -350,22 +437,21 @@ def calcular_situacao_aluno(
     total_sigeduc = df_sigeduc.height
     total_destino = df_destino.height
 
-    resumo, total_reclassificados = _resumir_por_cpf(
+    resumo, total_reclassificados = _resumir_por_matricula(
         df_sigeduc,
         coluna_cpf_sigeduc_r,
+        coluna_data_matricula_sigeduc_r,
         coluna_data_fim_r,
         coluna_data_encerramento_r,
         coluna_periodo_r,
         coluna_situacao_r,
-        status_aprovado,
         aplicar_transferencia_externa,
         coluna_censo_r,
     )
-    total_sigeduc_apos_limpeza = resumo.height  # já é 1 linha por CPF válido
+    total_sigeduc_apos_limpeza = resumo.height  # pares distintos de CPF e matrícula
 
-    # Renomeia para os nomes internos usados pelo SQL (`_cpf`, `_data_fim`,
-    # ...); `_qtd_aprovados` (vindo de `_resumir_por_cpf`) já está com o
-    # nome certo, não precisa entrar no mapeamento.
+    # Renomeia para os nomes internos usados pelo SQL; a contagem de
+    # aprovações é cruzada separadamente por CPF.
     renomeio = {
         coluna_cpf_sigeduc_r: "_cpf",
         coluna_data_fim_r: "_data_fim",
@@ -376,6 +462,12 @@ def calcular_situacao_aluno(
     if coluna_censo_r is not None:
         renomeio[coluna_censo_r] = "_censo"
     resumo = resumo.rename(renomeio)
+    contagem = contar_aprovados(
+        df_sigeduc.with_columns(
+            limpar_cpf(pl.col(coluna_cpf_sigeduc_r)).alias(coluna_cpf_sigeduc_r)
+        ).filter(pl.col(coluna_cpf_sigeduc_r).is_not_null()),
+        coluna_cpf_sigeduc_r, coluna_situacao_r, status_aprovado,
+    ).rename({coluna_cpf_sigeduc_r: "_cpf"})
 
     # Limpa o CPF do destino (mesma normalização usada do lado do SIGEDUC --
     # sem isso o cruzamento por CPF não bate) e garante que o destino já tem
@@ -387,6 +479,8 @@ def calcular_situacao_aluno(
     destino = df_destino.with_columns(
         limpar_cpf(pl.col(coluna_cpf_destino_r)).alias(coluna_cpf_destino_r)
     ).with_columns(
+        _data_matricula_normalizada(coluna_data_matricula_destino_r).alias("_matricula_destino")
+    ).with_columns(
         pl.lit(None, dtype=pl.Utf8).alias(coluna)
         for coluna in COLUNAS_DESTINO_GERADAS
         if coluna not in df_destino.columns
@@ -396,6 +490,7 @@ def calcular_situacao_aluno(
     con = duckdb.connect()
     con.register("destino", destino)
     con.register("resumo", resumo)
+    con.register("contagem", contagem)
     cruzado = con.sql(sql).pl()
     con.close()
 
@@ -413,11 +508,11 @@ def calcular_situacao_aluno(
                 & (censo_norm != entidade_norm)
             ).alias("_divergente_censo")
         )
-        df_divergentes = cruzado.filter(pl.col("_divergente_censo")).drop(["_encontrado_sigeduc", "_censo_sigeduc", "_divergente_censo"])
-        df_atualizado = cruzado.filter(~pl.col("_divergente_censo")).drop(["_encontrado_sigeduc", "_censo_sigeduc", "_divergente_censo"])
+        df_divergentes = cruzado.filter(pl.col("_divergente_censo")).drop(["_encontrado_sigeduc", "_censo_sigeduc", "_divergente_censo", "_matricula_destino"])
+        df_atualizado = cruzado.filter(~pl.col("_divergente_censo")).drop(["_encontrado_sigeduc", "_censo_sigeduc", "_divergente_censo", "_matricula_destino"])
         total_divergentes_censo = df_divergentes.height
     else:
-        df_atualizado = cruzado.drop("_encontrado_sigeduc")
+        df_atualizado = cruzado.drop("_encontrado_sigeduc", "_matricula_destino")
         df_divergentes = df_atualizado.head(0)
 
     relatorio = RelatorioSituacaoAluno(
@@ -519,6 +614,17 @@ if __name__ == "__main__":
             "QTD_MODULOS_APROVADOS": [None, None, None, None, None, None, None, None, 3],
         }
     )
+
+    sigeduc = sigeduc.with_columns(pl.Series("DATA MATRÍCULA", [
+        "01/01/2025", "01/06/2025", "01/12/2025",
+        "15/03/2026", "01/01/2025", "01/02/2025", "10/02/2026",
+        "01/01/2025", "01/06/2025", "01/01/2025", "01/07/2025",
+        "01/01/2026", "01/01/2025", "01/06/2025",
+    ]))
+    destino = destino.with_columns(pl.Series("DATA_MATRICULA", [
+        "01/12/2025", "15/03/2026", "01/02/2025", "10/02/2026",
+        "01/06/2025", "01/07/2025", "01/01/2026", "01/06/2025", "01/01/2026",
+    ]))
 
     print("=== Sem checagens extras (só o básico) ===")
     atualizado, divergentes, relatorio = calcular_situacao_aluno(sigeduc, destino, aplicar_transferencia_externa=False)

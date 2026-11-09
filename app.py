@@ -16,11 +16,16 @@ Execução local:
 from __future__ import annotations
 
 import datetime
+import importlib
+import inspect
 
 import duckdb
 import polars as pl
 import streamlit as st
 
+from src.core.ajuste_tercos_eja import preparar_ajuste_tercos_eja
+from src.core.cadastro_proxima_matricula import gerar_cadastro_proxima_matricula
+from src.core.reconciliacao_eja import reconciliar_eja
 from src.core.deduplicacao import (
     COLUNAS_ALOCACAO_CANDIDATAS,
     COLUNAS_ATUALIZACAO_CANDIDATAS,
@@ -35,6 +40,7 @@ from src.core.etapa_de_ensino import (
     COLUNAS_SERIE_CANDIDATAS,
     calcular_etapa_de_ensino,
 )
+from src.core.exclusao_movimentacao import excluir_cpfs_movimentacao
 from src.core.exportacao import ORDEM_PADRAO_MEC, exportar_padrao_mec
 from src.core.frequencia import (
     COLUNA_FALTAS_ALUNO_HORA,
@@ -74,6 +80,8 @@ from src.core.situacao_aluno import (
     COLUNAS_CPF_DESTINO_CANDIDATAS,
     COLUNAS_CPF_SIGEDUC_CANDIDATAS as COLUNAS_CPF_SIGEDUC_SITUACAO_CANDIDATAS,
     COLUNAS_DATA_ENCERRAMENTO_CANDIDATAS,
+    COLUNAS_DATA_MATRICULA_DESTINO_CANDIDATAS,
+    COLUNAS_DATA_MATRICULA_SIGEDUC_CANDIDATAS,
     COLUNAS_DATA_FIM_CANDIDATAS,
     COLUNAS_PERIODO_CANDIDATAS,
     COLUNAS_SITUACAO_CANDIDATAS,
@@ -84,6 +92,20 @@ from src.core.situacao_sigeduc import resumir_situacao_sigeduc
 from src.ui.downloads import botoes_download, para_bytes_excel
 from src.ui.uploader import carregar_planilha
 from src.utils.higienizacao import limpar_cpf, padronizar_textos
+
+# O Streamlit reexecuta app.py após uma edição, mas pode manter módulos de
+# src.core já importados na mesma sessão. Atualiza a função se a sessão
+# ainda estiver com a assinatura anterior do módulo F.
+if "coluna_data_matricula_sigeduc" not in inspect.signature(calcular_situacao_aluno).parameters:
+    calcular_situacao_aluno = importlib.reload(
+        importlib.import_module("src.core.situacao_aluno")
+    ).calcular_situacao_aluno
+
+# O Streamlit pode manter a lógica antiga em uma sessão já aberta mesmo
+# quando a assinatura não muda. Atualiza o módulo M em cada execução da tela.
+reconciliar_eja = importlib.reload(
+    importlib.import_module("src.core.reconciliacao_eja")
+).reconciliar_eja
 
 st.set_page_config(
     page_title="Escola 10 | Pé de Meia — Automação SEDUC",
@@ -106,6 +128,10 @@ MODULOS_CORE: dict[str, str | None] = {
     "📥 G. Situação de Matrícula (Somente SIGEDUC)": "situacao_sigeduc",
     "🔎 H. Comparar Situação SIGEDUC × SGP": "comparacao_situacao",
     "📚 I. Comparar Série/Ano SIGEDUC × SGP": "comparacao_serie",
+    "🧩 J. Ajuste de Terços EJA": "ajuste_tercos_eja",
+    "🧹 K. Retirar Movimentações do SGP": "exclusao_movimentacao",
+    "📥 L. Cadastro da Próxima Matrícula": "cadastro_proxima_matricula",
+    "🔄 M. Reconciliação Completa EJA": "reconciliacao_eja",
 }
 
 
@@ -1056,15 +1082,11 @@ def pagina_situacao_aluno() -> None:
     st.title("✅ F. Situação de Matrícula e Aprovações")
     st.markdown(
         """
-Cruza uma base **bruta do SIGEDUC** (situação de matrícula/aprovação, um
-registro por período do aluno) com a base de **destino** (Pé de Meia/SGP a
-atualizar), pelo CPF, e preenche 5 colunas a partir da situação **mais
-recente** de cada aluno (critério: a `DATA ENCERRAMENTO` mais nova;
-sem nenhuma data válida, mantém o último registro da planilha):
-
-- **`DATA_FIM_OU_APROVACAO`** e **`DATA_CONCLUSAO_ENSINO_MEDIO`** — datas do registro mais recente.
-- **`PERIODO`** e **`SITUACAO_MATRICULA_RECENTE`** — período e situação do registro mais recente.
-- **`QTD_MODULOS_APROVADOS`** — quantos registros *daquele CPF* (não só o mais recente) têm situação de aprovação.
+Cruza SIGEDUC e destino pelo **CPF e pela data de matrícula**. A situação,
+o período e as datas principais vêm da matrícula correspondente. Se houver
+outra matrícula posterior do mesmo aluno, sua data e situação aparecem em
+colunas adicionais, sem substituir a situação principal. `QTD_MODULOS_APROVADOS`
+continua contando as aprovações de todo o histórico do CPF.
 
 Um CPF do destino que não aparece no SIGEDUC enviado mantém os valores que
 já tinha (menos `QTD_MODULOS_APROVADOS`, que sempre reflete só a rodada
@@ -1113,6 +1135,18 @@ com Polars + DuckDB em `src/core/situacao_aluno.py`.
         index=df_destino.columns.index(_padrao(df_destino.columns, COLUNAS_CPF_DESTINO_CANDIDATAS)),
     )
 
+    col_mat1, col_mat2 = st.columns(2)
+    coluna_data_matricula_sigeduc = col_mat1.selectbox(
+        "Coluna de Data de Matrícula (SIGEDUC)",
+        options=df_sigeduc.columns,
+        index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_DATA_MATRICULA_SIGEDUC_CANDIDATAS)),
+    )
+    coluna_data_matricula_destino = col_mat2.selectbox(
+        "Coluna de Data de Matrícula (destino)",
+        options=df_destino.columns,
+        index=df_destino.columns.index(_padrao(df_destino.columns, COLUNAS_DATA_MATRICULA_DESTINO_CANDIDATAS)),
+    )
+
     col3, col4, col5 = st.columns(3)
     coluna_data_fim = col3.selectbox(
         "Coluna de Data Fim (SIGEDUC)",
@@ -1123,8 +1157,8 @@ com Polars + DuckDB em `src/core/situacao_aluno.py`.
         "Coluna de Data Encerramento (SIGEDUC)",
         options=df_sigeduc.columns,
         index=df_sigeduc.columns.index(_padrao(df_sigeduc.columns, COLUNAS_DATA_ENCERRAMENTO_CANDIDATAS)),
-        help="Além de virar 'DATA_CONCLUSAO_ENSINO_MEDIO', esta coluna decide qual "
-        "registro é a 'situação mais recente' de cada CPF.",
+        help="Se o SIGEDUC tiver registros repetidos do mesmo CPF e data de matrícula, "
+        "esta data decide qual registro dessa matrícula usar.",
     )
     coluna_periodo = col5.selectbox(
         "Coluna de Período (SIGEDUC)",
@@ -1152,7 +1186,7 @@ com Polars + DuckDB em `src/core/situacao_aluno.py`.
     aplicar_transferencia_externa = col_op1.checkbox(
         "Reclassificar 'Transferência Externa'",
         value=True,
-        help="Um CPF cuja situação mais recente é 'TRANSFERIDO' e que nunca teve "
+        help="Um CPF cuja situação da matrícula correspondente é 'TRANSFERIDO' e que nunca teve "
         "nenhuma outra situação no histórico do SIGEDUC enviado é reclassificado "
         "para 'TRANSFERÊNCIA EXTERNA' — ele nunca chegou a se matricular de fato "
         "aqui, só existe por já ter vindo transferido de outra rede/escola.",
@@ -1160,8 +1194,8 @@ com Polars + DuckDB em `src/core/situacao_aluno.py`.
     aplicar_checagem_censo = col_op2.checkbox(
         "Checar divergência de Censo × CO_ENTIDADE",
         value=False,
-        help="Compara o código de Censo/INEP do SIGEDUC com o CO_ENTIDADE do destino "
-        "para cada CPF encontrado; quem divergir é removido da base principal e "
+        help="Compara o Censo/INEP da matrícula correspondente no SIGEDUC com o "
+        "CO_ENTIDADE do destino; quem divergir é removido da base principal e "
         "devolvido à parte, para conferência manual.",
     )
 
@@ -1189,6 +1223,8 @@ com Polars + DuckDB em `src/core/situacao_aluno.py`.
             df_destino,
             coluna_cpf_sigeduc=coluna_cpf_sigeduc,
             coluna_cpf_destino=coluna_cpf_destino,
+            coluna_data_matricula_sigeduc=coluna_data_matricula_sigeduc,
+            coluna_data_matricula_destino=coluna_data_matricula_destino,
             coluna_data_fim=coluna_data_fim,
             coluna_data_encerramento=coluna_data_encerramento,
             coluna_periodo=coluna_periodo,
@@ -1218,8 +1254,8 @@ com Polars + DuckDB em `src/core/situacao_aluno.py`.
 
     if relatorio.total_sem_correspondencia_sigeduc:
         st.caption(
-            f"ℹ️ {relatorio.total_sem_correspondencia_sigeduc} CPF(s) do destino não foram "
-            "encontrados na base SIGEDUC enviada — mantiveram os valores que já tinham "
+            f"ℹ️ {relatorio.total_sem_correspondencia_sigeduc} linha(s) do destino não tiveram "
+            "CPF e data de matrícula correspondentes no SIGEDUC — mantiveram os valores que já tinham "
             "(exceto QTD_MODULOS_APROVADOS, que ficou 0)."
         )
     if relatorio.total_divergentes_censo:
@@ -1256,9 +1292,9 @@ recebe, para cada CPF encontrado, a **linha inteira** do registro mais
 recente (todas as colunas originais da planilha — nome, escola,
 nascimento, o que ela tiver) mais a coluna `QTD_MODULOS_APROVADOS`.
 
-"Mais recente" usa o mesmo critério do Módulo F: prioriza a `DATA
-ENCERRAMENTO` mais nova; sem nenhuma data válida em nenhum registro do
-CPF, mantém o último registro na ordem original da planilha.
+Neste módulo, "mais recente" prioriza a `DATA ENCERRAMENTO` mais nova;
+sem nenhuma data válida em qualquer registro do CPF, mantém o último
+registro na ordem original da planilha.
 
 Diferenças em relação ao Módulo F: o resultado só traz CPFs que **existem**
 no SIGEDUC enviado (não há uma base de destino para preservar quem não
@@ -1572,6 +1608,554 @@ def pagina_comparacao_serie() -> None:
     )
 
 
+def pagina_ajuste_tercos_eja() -> None:
+    st.title("🧩 J. Ajuste de Terços EJA")
+    st.write(
+        "Para alunos registrados no 1º terço que já têm três aprovações em módulo "
+        "no SIGEDUC, gera dois resultados: a planilha de dados corretos com as "
+        "datas da 1ª e 2ª aprovação e a planilha de cadastro com as datas da 3ª."
+    )
+    col1, col2, col3 = st.columns(3)
+    arquivo_sigeduc = col1.file_uploader(
+        "SIGEDUC (histórico de aprovações)", type=["csv", "xlsx", "xls"], key="eja_sigeduc"
+    )
+    arquivo_corretos = col2.file_uploader(
+        "Alunos com dados corretos (1º terço)", type=["csv", "xlsx", "xls"], key="eja_corretos"
+    )
+    arquivo_cadastro = col3.file_uploader(
+        "Cadastro dos alunos", type=["csv", "xlsx", "xls"], key="eja_cadastro"
+    )
+    if not all((arquivo_sigeduc, arquivo_corretos, arquivo_cadastro)):
+        st.caption("Envie as três planilhas para escolher as colunas e gerar os resultados.")
+        return
+    try:
+        sigeduc = carregar_planilha(arquivo_sigeduc)
+        corretos = carregar_planilha(arquivo_corretos)
+        cadastro = carregar_planilha(arquivo_cadastro)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler uma das planilhas: {exc}")
+        return
+    if not all((sigeduc.columns, corretos.columns, cadastro.columns)):
+        st.error("As três planilhas precisam ter cabeçalhos de coluna.")
+        return
+
+    def selecionar(titulo: str, df: pl.DataFrame, candidatos: tuple[str, ...], chave: str) -> str | None:
+        sugerida = encontrar_coluna(df, candidatos)
+        return st.selectbox(
+            titulo, options=df.columns,
+            index=df.columns.index(sugerida) if sugerida else None,
+            placeholder="Selecione a coluna",
+            key=f"eja_{chave}",
+        )
+
+    st.subheader("Colunas do SIGEDUC")
+    sig1, sig2, sig3, sig4 = st.columns(4)
+    with sig1:
+        cpf_sig = selecionar("CPF", sigeduc, ("ESTUDANTE_CPF", "NU CPF", "CPF"), "cpf_sig")
+    with sig2:
+        matricula_sig = selecionar("Data de matrícula", sigeduc, COLUNAS_DATA_CANDIDATAS, "mat_sig")
+    with sig3:
+        encerramento_sig = selecionar("Data de encerramento", sigeduc, COLUNAS_ENCERRAMENTO_CANDIDATAS, "fim_sig")
+    with sig4:
+        situacao_sig = selecionar(
+            "Situação da matrícula", sigeduc,
+            ("SITUAÇÃO MATRÍCULA", "SITUACAO MATRÍCULA", "SITUACAO_MATRICULA", "SITUACAO"),
+            "situacao_sig",
+        )
+
+    st.subheader("Alunos com dados corretos")
+    corr1, corr2 = st.columns(2)
+    with corr1:
+        cpf_corretos = selecionar("CPF", corretos, ("ESTUDANTE_CPF", "NU CPF", "CPF"), "cpf_corretos")
+    with corr2:
+        terco_sugerido = encontrar_coluna(
+            corretos, COLUNAS_ANO_PERIODO_TERCO_FREQ_CANDIDATAS
+        )
+        opcoes_terco = [None, *corretos.columns]
+        coluna_terco = st.selectbox(
+            "Coluna do terço (opcional se esta planilha já contém só o 1º terço)",
+            options=opcoes_terco,
+            index=opcoes_terco.index(terco_sugerido) if terco_sugerido else 0,
+            format_func=lambda valor: "Planilha já filtrada para 1º terço" if valor is None else valor,
+            key="eja_coluna_terco",
+        )
+    valor_terco = None
+    if coluna_terco is not None:
+        valores = sorted({
+            str(valor).strip() for valor in corretos[coluna_terco].to_list()
+            if valor is not None and str(valor).strip()
+        })
+        if not valores:
+            st.error("A coluna de terço selecionada não tem valores preenchidos.")
+            return
+        indice_primeiro = next(
+            (i for i, valor in enumerate(valores)
+             if valor.upper().replace("º", "").replace("°", "").startswith("1")), 0
+        )
+        valor_terco = st.selectbox(
+            "Valor que representa o 1º terço", options=valores,
+            index=indice_primeiro, key="eja_valor_terco",
+        )
+
+    st.subheader("Cadastro")
+    cad1, cad2 = st.columns(2)
+    with cad1:
+        cpf_cadastro = selecionar("CPF", cadastro, ("ESTUDANTE_CPF", "NU CPF", "CPF"), "cpf_cadastro")
+    with cad2:
+        data_cadastro_sugerida = encontrar_coluna(cadastro, COLUNAS_DATA_CANDIDATAS)
+        opcoes_data = [None, *cadastro.columns]
+        matricula_cadastro = st.selectbox(
+            "Data de matrícula da 3ª aprovação (opcional para conferir a linha do cadastro)",
+            options=opcoes_data,
+            index=opcoes_data.index(data_cadastro_sugerida) if data_cadastro_sugerida else 0,
+            format_func=lambda valor: "Cruzar cadastro somente pelo CPF" if valor is None else valor,
+            key="eja_data_cadastro",
+        )
+
+    filtrar_ano = st.checkbox(
+        "Limitar aprovações ao ano da matrícula", value=False, key="eja_filtrar_ano",
+        help="Útil se o histórico do SIGEDUC inclui aprovações de anos anteriores.",
+    )
+    ano = st.number_input(
+        "Ano da matrícula", min_value=2000, max_value=2100,
+        value=datetime.date.today().year, step=1, key="eja_ano",
+    ) if filtrar_ano else None
+    st.caption(
+        "As aprovações são ordenadas pela data de encerramento. Registros repetidos "
+        "com as mesmas datas contam uma vez. Só entram alunos com três aprovações válidas."
+    )
+    if not st.button("▶️ Gerar ajustes dos terços", type="primary", key="eja_gerar"):
+        return
+    if None in (cpf_sig, matricula_sig, encerramento_sig, situacao_sig, cpf_corretos, cpf_cadastro):
+        st.error("Selecione as colunas de CPF, matrícula, encerramento e situação necessárias.")
+        return
+    try:
+        ajuste, cadastro_final, resumo = preparar_ajuste_tercos_eja(
+            sigeduc, corretos, cadastro,
+            cpf_sigeduc=cpf_sig,
+            matricula_sigeduc=matricula_sig,
+            encerramento_sigeduc=encerramento_sig,
+            situacao_sigeduc=situacao_sig,
+            cpf_dados_corretos=cpf_corretos,
+            cpf_cadastro=cpf_cadastro,
+            coluna_terco_dados=coluna_terco,
+            valor_primeiro_terco=valor_terco,
+            matricula_cadastro=matricula_cadastro,
+            ano_referencia=int(ano) if ano is not None else None,
+        )
+    except (KeyError, ValueError) as exc:
+        st.error(str(exc))
+        return
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("CPFs do 1º terço", resumo["cpfs_primeiro_terco"])
+    m2.metric("Com três aprovações", resumo["cpfs_com_tres_aprovacoes"])
+    m3.metric("Ajustes do 1º terço", resumo["ajustes_primeiro_terco"])
+    m4.metric("Cadastros da 3ª aprovação", resumo["cadastros_terceiro_terco"])
+    if resumo["aprovacoes_sem_data"]:
+        st.warning(
+            f"{resumo['aprovacoes_sem_data']} aprovação(ões) sem matrícula ou "
+            "encerramento válido ficaram fora da contagem."
+        )
+    if resumo["sem_cadastro_correspondente"]:
+        st.warning(
+            f"{resumo['sem_cadastro_correspondente']} aluno(s) do ajuste não têm "
+            "linha correspondente no cadastro enviado."
+        )
+    aba_ajuste, aba_cadastro = st.tabs([
+        f"1º terço ({ajuste.height})", f"Cadastro da 3ª aprovação ({cadastro_final.height})"
+    ])
+    with aba_ajuste:
+        st.caption("Colunas originais dos dados corretos + matrícula da 1ª e encerramento da 2ª aprovação.")
+        st.dataframe(ajuste, width="stretch", hide_index=True)
+        if not ajuste.is_empty():
+            botoes_download(ajuste, nome_base="ajuste_primeiro_terco_eja", key_prefix="eja_ajuste")
+    with aba_cadastro:
+        st.caption("Colunas originais do cadastro + matrícula e encerramento da 3ª aprovação.")
+        st.dataframe(cadastro_final, width="stretch", hide_index=True)
+        if not cadastro_final.is_empty():
+            botoes_download(cadastro_final, nome_base="cadastro_terceiro_terco_eja", key_prefix="eja_cadastro")
+
+
+def pagina_exclusao_movimentacao() -> None:
+    st.title("🧹 K. Retirar Movimentações do SGP")
+    st.write(
+        "Envie a planilha do SGP e a de movimentação. O resultado mantém todas "
+        "as colunas e linhas do SGP, exceto as dos CPFs presentes na movimentação."
+    )
+    coluna_sgp, coluna_movimentacao = st.columns(2)
+    arquivo_sgp = coluna_sgp.file_uploader(
+        "Planilha do SGP", type=["csv", "xlsx", "xls"], key="exclusao_sgp"
+    )
+    arquivo_movimentacao = coluna_movimentacao.file_uploader(
+        "Planilha de movimentação", type=["csv", "xlsx", "xls"], key="exclusao_mov"
+    )
+    if arquivo_sgp is None or arquivo_movimentacao is None:
+        st.caption("Envie as duas planilhas para selecionar as colunas de CPF.")
+        return
+    try:
+        sgp = carregar_planilha(arquivo_sgp)
+        movimentacao = carregar_planilha(arquivo_movimentacao)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler uma das planilhas: {exc}")
+        return
+    if not sgp.columns or not movimentacao.columns:
+        st.error("As duas planilhas precisam ter cabeçalhos de coluna.")
+        return
+
+    with coluna_sgp:
+        sugestao_sgp = encontrar_coluna(sgp, COLUNAS_CPF_SGP_MOV_CANDIDATAS)
+        cpf_sgp = st.selectbox(
+            "Coluna de CPF no SGP", sgp.columns,
+            index=sgp.columns.index(sugestao_sgp) if sugestao_sgp else None,
+            placeholder="Selecione a coluna", key="exclusao_cpf_sgp",
+        )
+    with coluna_movimentacao:
+        sugestao_mov = encontrar_coluna(
+            movimentacao, COLUNAS_CPF_SIGEDUC_MOV_CANDIDATAS
+        )
+        cpf_mov = st.selectbox(
+            "Coluna de CPF na movimentação", movimentacao.columns,
+            index=movimentacao.columns.index(sugestao_mov) if sugestao_mov else None,
+            placeholder="Selecione a coluna", key="exclusao_cpf_mov",
+        )
+    if not st.button("▶️ Gerar SGP sem movimentações", type="primary", key="exclusao_gerar"):
+        return
+    if cpf_sgp is None or cpf_mov is None:
+        st.error("Selecione a coluna de CPF em cada planilha.")
+        return
+    try:
+        resultado, resumo = excluir_cpfs_movimentacao(
+            sgp, movimentacao, cpf_sgp=cpf_sgp, cpf_movimentacao=cpf_mov
+        )
+    except (KeyError, ValueError) as exc:
+        st.error(str(exc))
+        return
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Linhas do SGP", resumo["linhas_sgp"])
+    m2.metric("Linhas removidas", resumo["linhas_removidas"])
+    m3.metric("Linhas restantes", resumo["linhas_restantes"])
+    st.dataframe(resultado, width="stretch", hide_index=True)
+    botoes_download(resultado, nome_base="sgp_sem_movimentacoes", key_prefix="exclusao_mov")
+
+
+def pagina_cadastro_proxima_matricula() -> None:
+    st.title("📥 L. Cadastro da Próxima Matrícula")
+    st.write(
+        "Use o resultado do módulo F e o histórico bruto do SIGEDUC. Para cada "
+        "CPF e data de matrícula do resultado F, localiza a primeira matrícula "
+        "posterior com situação MATRICULADO no SIGEDUC e gera o cadastro no "
+        "mesmo formato do módulo C."
+    )
+    col_base, col_sig = st.columns(2)
+    arquivo_base = col_base.file_uploader(
+        "Resultado do módulo F (situação_aluno_atualizado)",
+        type=["csv", "xlsx", "xls"], key="proxima_base",
+    )
+    arquivos_sigeduc = col_sig.file_uploader(
+        "Planilha(s) bruta(s) do SIGEDUC", type=["csv", "xlsx", "xls"],
+        accept_multiple_files=True, key="proxima_sigeduc",
+    )
+    if arquivo_base is None or not arquivos_sigeduc:
+        st.caption("Envie o resultado do módulo F e ao menos uma planilha do SIGEDUC.")
+        return
+    try:
+        base = carregar_planilha(arquivo_base)
+        sigeduc = pl.concat(
+            [carregar_planilha(arquivo) for arquivo in arquivos_sigeduc],
+            how="diagonal_relaxed",
+        )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler uma das planilhas: {exc}")
+        return
+    if not base.columns or not sigeduc.columns:
+        st.error("As planilhas precisam ter cabeçalhos de coluna.")
+        return
+
+    def escolher(rotulo: str, df: pl.DataFrame, candidatos: tuple[str, ...], chave: str) -> str | None:
+        sugestao = encontrar_coluna(df, candidatos)
+        return st.selectbox(
+            rotulo, options=df.columns,
+            index=df.columns.index(sugestao) if sugestao else None,
+            placeholder="Selecione a coluna", key=f"proxima_{chave}",
+        )
+
+    st.subheader("Colunas do resultado F")
+    col1, col2 = st.columns(2)
+    with col1:
+        cpf_base = escolher("CPF", base, COLUNAS_CPF_DESTINO_CANDIDATAS, "cpf_base")
+    with col2:
+        data_base = escolher(
+            "Data de matrícula da matrícula original", base,
+            COLUNAS_DATA_MATRICULA_DESTINO_CANDIDATAS, "data_base",
+        )
+
+    st.subheader("Colunas do SIGEDUC")
+    col3, col4, col5 = st.columns(3)
+    with col3:
+        cpf_sig = escolher("CPF", sigeduc, COLUNAS_CPF_SIGEDUC_MOV_CANDIDATAS, "cpf_sig")
+    with col4:
+        data_sig = escolher("Data de matrícula", sigeduc, COLUNAS_DATA_MATRICULA_SIGEDUC_CANDIDATAS, "data_sig")
+    with col5:
+        censo_sig = escolher("Censo/INEP", sigeduc, COLUNAS_CENSO_SIGEDUC_CANDIDATAS, "censo_sig")
+    col6, col7, col8 = st.columns(3)
+    with col6:
+        situacao_sig = escolher("Situação da matrícula", sigeduc, COLUNAS_SITUACAO_SIGEDUC_CANDIDATAS, "situacao_sig")
+    with col7:
+        oferta_sig = escolher("Oferta de ensino", sigeduc, COLUNAS_OFERTA_CANDIDATAS, "oferta_sig")
+    with col8:
+        serie_sig = escolher("Série", sigeduc, COLUNAS_SERIE_CANDIDATAS, "serie_sig")
+
+    col9, col10 = st.columns(2)
+    with col9:
+        sugestao_encerramento = encontrar_coluna(
+            sigeduc, COLUNAS_DATA_ENCERRAMENTO_SIGEDUC_CANDIDATAS
+        )
+        opcoes_encerramento = [None, *sigeduc.columns]
+        encerramento_sig = st.selectbox(
+            "Data de encerramento (desempate opcional)", opcoes_encerramento,
+            index=opcoes_encerramento.index(sugestao_encerramento) if sugestao_encerramento else 0,
+            format_func=lambda valor: "Não usar" if valor is None else valor,
+            key="proxima_encerramento_sig",
+        )
+    with col10:
+        sugestao_terco = encontrar_coluna(sigeduc, COLUNAS_ANO_PERIODO_TERCO_CANDIDATAS)
+        opcoes_terco = [None, *sigeduc.columns]
+        terco_sig = st.selectbox(
+            "Terço da nova matrícula (opcional)", opcoes_terco,
+            index=opcoes_terco.index(sugestao_terco) if sugestao_terco else 0,
+            format_func=lambda valor: "Deixar vazio" if valor is None else valor,
+            key="proxima_terco_sig",
+        )
+    st.caption(
+        "A data escolhida é a menor data do SIGEDUC estritamente posterior "
+        "à data da linha do módulo F entre as matrículas com situação "
+        "MATRICULADO. Matrículas sem data válida ficam fora."
+    )
+    if not st.button("▶️ Gerar cadastro da próxima matrícula", type="primary", key="proxima_gerar"):
+        return
+    if any(valor is None for valor in (
+        cpf_base, data_base, cpf_sig, data_sig, censo_sig,
+        situacao_sig, oferta_sig, serie_sig,
+    )):
+        st.error("Selecione todas as colunas obrigatórias.")
+        return
+    try:
+        cadastro, resumo = gerar_cadastro_proxima_matricula(
+            base, sigeduc,
+            cpf_resultado=cpf_base, matricula_resultado=data_base,
+            cpf_sigeduc=cpf_sig, matricula_sigeduc=data_sig,
+            censo_sigeduc=censo_sig, situacao_sigeduc=situacao_sig,
+            oferta_sigeduc=oferta_sig, serie_sigeduc=serie_sig,
+            encerramento_sigeduc=encerramento_sig, terco_sigeduc=terco_sig,
+        )
+    except (KeyError, ValueError) as exc:
+        st.error(str(exc))
+        return
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Matrículas válidas na base", resumo["matriculas_base_validas"])
+    m2.metric("Cadastros gerados", resumo["cadastros_gerados"])
+    m3.metric("Sem matrícula posterior como MATRICULADO", resumo["sem_matricula_posterior"])
+    st.dataframe(cadastro, width="stretch", hide_index=True)
+    botoes_download(
+        cadastro, nome_base="cadastro_proxima_matricula", key_prefix="proxima_cadastro"
+    )
+
+
+def pagina_reconciliacao_eja() -> None:
+    st.title("🔄 M. Reconciliação Completa EJA")
+    st.write(
+        "Compara CPF, data, escola e terço de cada matrícula do EJA Médio. "
+        "O histórico completo conta as aprovações para definir o terço; "
+        "as correções começam na data escolhida na planilha de foco "
+        "(ou na matrícula atual do SGP, sem essa data). Se a data indicada "
+        "ainda pertence ao terço anterior, começa na primeira matrícula "
+        "do terço que está sendo corrigido. Gera uma matrícula por aluno "
+        "e rodada, sempre na data exata do SIGEDUC. Quando a matrícula atual "
+        "tem resultado e existe outra matrícula pendente, também prepara "
+        "o cadastro da data seguinte."
+    )
+    c1, c2, c3 = st.columns(3)
+    arquivo_atual = c1.file_uploader("SGP atual", type=["xlsx", "xls", "csv"], key="eja_atual")
+    arquivo_historico = c2.file_uploader("Histórico SGP 2025 e 2026", type=["xlsx", "xls", "csv"], key="eja_historico")
+    arquivo_sig = c3.file_uploader("SIGEDUC bruto 2025 e 2026", type=["xlsx", "xls", "csv"], key="eja_sig")
+    arquivo_foco = st.file_uploader(
+        "Planilha com CPFs para limitar a análise (opcional; por exemplo, resultado F)",
+        type=["xlsx", "xls", "csv"], key="eja_foco"
+    )
+    if not all((arquivo_atual, arquivo_historico, arquivo_sig)):
+        st.caption("Envie as três planilhas para configurar as colunas.")
+        return
+    try:
+        atual = carregar_planilha(arquivo_atual)
+        historico = carregar_planilha(arquivo_historico)
+        sigeduc = carregar_planilha(arquivo_sig)
+        foco = carregar_planilha(arquivo_foco) if arquivo_foco else None
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não foi possível ler as planilhas: {exc}")
+        return
+
+    def escolher(df: pl.DataFrame, titulo: str, padrao: str, chave: str) -> str:
+        opcoes = df.columns
+        return st.selectbox(
+            titulo, opcoes, index=opcoes.index(padrao) if padrao in opcoes else 0,
+            key=f"eja_{chave}",
+        )
+
+    st.subheader("Colunas do SGP atual")
+    c = st.columns(3)
+    cpf_atual = c[0].selectbox("CPF atual", atual.columns, index=atual.columns.index("ESTUDANTE_CPF") if "ESTUDANTE_CPF" in atual.columns else 0, key="eja_cpf_atual")
+    data_atual = escolher(atual, "Data de matrícula atual", "DATA_INICIO_MATRICULA", "data_atual")
+    terco_atual = escolher(atual, "Terço atual", "ESTUDANTE_ANO_PERIODO", "terco_atual")
+    situacao_atual = escolher(atual, "Código de situação atual", "ESTUDANTE_MATRICULA_SITUACAO", "situacao_atual")
+    id_atual = escolher(atual, "ID da matrícula atual", "ID_SGP_MATRICULA", "id_atual")
+    escola_atual = escolher(atual, "Código da escola atual", "CO_ENTIDADE", "escola_atual")
+
+    st.subheader("Colunas do histórico SGP")
+    cpf_historico = escolher(historico, "CPF histórico", "ESTUDANTE_CPF", "cpf_historico")
+    data_historico = escolher(historico, "Data de matrícula histórica", "DATA_INICIO_MATRICULA", "data_historico")
+    terco_historico = escolher(historico, "Terço histórico", "ESTUDANTE_ANO_PERIODO", "terco_historico")
+    situacao_historico = escolher(historico, "Código de situação histórica", "ESTUDANTE_MATRICULA_SITUACAO", "situacao_historico")
+    id_historico = escolher(historico, "ID da matrícula histórica", "ID_SGP_MATRICULA", "id_historico")
+    escola_historico = escolher(historico, "Código da escola histórica", "CO_ENTIDADE", "escola_historico")
+
+    st.subheader("Colunas do SIGEDUC")
+    cpf_sigeduc = escolher(sigeduc, "CPF SIGEDUC", "NU CPF", "cpf_sigeduc")
+    data_sigeduc = escolher(sigeduc, "Data de matrícula SIGEDUC", "DATA MATRÍCULA", "data_sigeduc")
+    encerramento_sigeduc = escolher(sigeduc, "Data de encerramento SIGEDUC", "DATA ENCERRAMENTO", "encerramento_sigeduc")
+    situacao_sigeduc = escolher(sigeduc, "Situação SIGEDUC", "SITUACAO MATRÍCULA", "situacao_sigeduc")
+    censo_sigeduc = escolher(sigeduc, "Censo/INEP da escola SIGEDUC", "CENSO", "censo_sigeduc")
+    oferta_sigeduc = escolher(sigeduc, "Oferta de ensino SIGEDUC", "OFERTA DE ENSINO", "oferta_sigeduc")
+    serie_sigeduc = escolher(sigeduc, "Série SIGEDUC", "SÉRIE", "serie_sigeduc")
+    cpf_foco = escolher(foco, "CPF da planilha de foco", "ESTUDANTE_CPF", "cpf_foco") if foco is not None else None
+    data_foco = None
+    terco_foco = None
+    corrigir_pendentes_foco = False
+    situacao_conclusao_foco = None
+    data_conclusao_foco = None
+    if foco is not None:
+        opcoes_data_foco = [None, *foco.columns]
+        padrao_data_foco = "DATA_INICIO_MATRICULA" if "DATA_INICIO_MATRICULA" in foco.columns else None
+        data_foco = st.selectbox(
+            "Data da matrícula a corrigir (planilha de foco, opcional)",
+            opcoes_data_foco, index=opcoes_data_foco.index(padrao_data_foco),
+            format_func=lambda valor: "Não usar" if valor is None else valor,
+            key="eja_data_foco",
+        )
+        opcoes_terco_foco = [None, *foco.columns]
+        padrao_terco_foco = "ESTUDANTE_ANO_PERIODO" if "ESTUDANTE_ANO_PERIODO" in foco.columns else None
+        terco_foco = st.selectbox(
+            "Terço da matrícula a corrigir (planilha de foco, opcional)",
+            opcoes_terco_foco, index=opcoes_terco_foco.index(padrao_terco_foco),
+            format_func=lambda valor: "Não usar" if valor is None else valor,
+            key="eja_terco_foco",
+        )
+        nome_foco_eja = getattr(arquivo_foco, "name", "")
+        if (st.session_state.get("eja_foco_nome_anterior") != nome_foco_eja
+                or "eja_corrigir_pendentes_foco" not in st.session_state):
+            st.session_state["eja_corrigir_pendentes_foco"] = (
+                nome_foco_eja.casefold() == "aprovados-3terco.xlsx"
+            )
+            st.session_state["eja_foco_nome_anterior"] = nome_foco_eja
+        corrigir_pendentes_foco = st.checkbox(
+            "Corrigir as matrículas pendentes desta planilha de foco em ordem",
+            key="eja_corrigir_pendentes_foco",
+        )
+        if corrigir_pendentes_foco:
+            situacao_conclusao_foco = escolher(
+                foco, "Situação final confirmada no foco",
+                "SITUACAO_MATRICULA_RECENTE", "situacao_conclusao_foco"
+            )
+            data_conclusao_foco = escolher(
+                foco, "Data de conclusão confirmada no foco",
+                "DATA_CONCLUSAO_ENSINO_MEDIO", "data_conclusao_foco"
+            )
+            st.caption(
+                "Quando existe matrícula posterior, corrige primeiro a matrícula atual "
+                "no terço calculado pelo SIGEDUC. Se a matrícula atual já está correta "
+                "e só falta o resultado, o cadastro da data seguinte sai nesta rodada. "
+                "As demais datas entram em outras rodadas. "
+                "Sem aprovação posterior, o foco pode confirmar a conclusão por uma "
+                "aprovação anterior com a mesma data de encerramento."
+            )
+
+    st.caption(
+        "Código 1 derruba a matrícula incorreta. Resultados confirmados: "
+        "10 aprovado, 11 concluinte na quarta aprovação, 12 reprovado, "
+        "7 abandono e texto cancelado. Transferências sem código definido vão para conferência. "
+        "A data de encerramento preenche DATA_FIM_OU_APROVACAO. "
+        "O terço da planilha de foco identifica qual matrícula corrigir; "
+        "o terço correto é calculado pelas aprovações do SIGEDUC. "
+        "Se a última matrícula do SIGEDUC está aprovada, tem a mesma data e escola "
+        "da matrícula atual do 3º terço no SGP e não existe matrícula posterior, "
+        "o módulo informa a conclusão (código 11) sem gerar cadastro."
+    )
+    if not st.button("▶️ Analisar e gerar próxima ação", type="primary", key="eja_gerar"):
+        return
+    try:
+        diagnostico, movimentacao, cadastro, resumo = reconciliar_eja(
+            atual, historico, sigeduc,
+            cpf_atual=cpf_atual, data_atual=data_atual, terco_atual=terco_atual,
+            situacao_atual=situacao_atual, id_atual=id_atual, escola_atual=escola_atual,
+            cpf_historico=cpf_historico, data_historico=data_historico,
+            terco_historico=terco_historico, situacao_historico=situacao_historico,
+            id_historico=id_historico, escola_historico=escola_historico,
+            cpf_sigeduc=cpf_sigeduc, data_sigeduc=data_sigeduc,
+            encerramento_sigeduc=encerramento_sigeduc, situacao_sigeduc=situacao_sigeduc,
+            censo_sigeduc=censo_sigeduc, oferta_sigeduc=oferta_sigeduc,
+            serie_sigeduc=serie_sigeduc, foco=foco, cpf_foco=cpf_foco,
+            data_foco=data_foco, terco_foco=terco_foco,
+            corrigir_pendentes_foco=corrigir_pendentes_foco,
+            situacao_conclusao_foco=situacao_conclusao_foco,
+            data_conclusao_foco=data_conclusao_foco,
+        )
+    except (KeyError, ValueError) as exc:
+        st.error(str(exc))
+        return
+    metrics = st.columns(6)
+    metrics[0].metric("Alunos analisados", resumo["alunos_sgp"])
+    metrics[1].metric("Movimentações geradas", movimentacao.height)
+    metrics[2].metric("Derrubar (código 1)", resumo["derrubar"])
+    metrics[3].metric("Informar resultado", resumo["resultados"])
+    metrics[4].metric("Cadastros gerados", resumo["cadastros"])
+    metrics[5].metric("Linhas para conferir", resumo["conferir"])
+    pendencias = st.columns(3)
+    pendencias[0].metric("Matrículas SIGEDUC desde o início", resumo["matriculas_no_escopo"])
+    pendencias[1].metric("Datas ainda faltando no SGP", resumo["datas_pendentes"])
+    pendencias[2].metric("Matrículas SGP sem correspondência", resumo["matriculas_excedentes"])
+    st.caption(
+        "Matrículas anteriores ao início da correção servem apenas para contar "
+        "aprovações. As pendências do período são processadas em ordem de data."
+    )
+    if movimentacao.height or cadastro.height:
+        st.info(
+            "Importe primeiro a movimentação desta rodada, incluindo códigos 1 "
+            "e resultados da matrícula atual. Depois importe os cadastros gerados. "
+            "Baixe novamente o SGP atual e o histórico para obter os novos IDs "
+            "e execute o módulo para tratar as matrículas cadastradas e as datas seguintes."
+        )
+    if resumo["sem_matricula_posterior"]:
+        st.warning(
+            f"{resumo['sem_matricula_posterior']} aluno(s) não têm matrícula posterior "
+            "à data de início da correção no SIGEDUC enviado. Isso não impede "
+            "o cadastro ou o resultado da matrícula nessa data."
+        )
+    if movimentacao.height:
+        st.subheader("Movimentação desta rodada para importar no SGP")
+        botoes_download(movimentacao, nome_base="movimentacao_eja", key_prefix="eja_mov")
+        st.dataframe(movimentacao, width="stretch", hide_index=True)
+    if cadastro.height:
+        st.subheader("Cadastro da matrícula correta ou posterior")
+        botoes_download(cadastro, nome_base="cadastro_eja", key_prefix="eja_cad")
+        st.dataframe(cadastro, width="stretch", hide_index=True)
+    st.subheader("Histórico e próxima ação")
+    if diagnostico.height:
+        botoes_download(diagnostico, nome_base="diagnostico_eja", key_prefix="eja_diag")
+    st.dataframe(diagnostico, width="stretch", hide_index=True)
+
+
 def pagina_em_breve(titulo: str) -> None:
     st.title(titulo)
     st.info(
@@ -1592,6 +2176,10 @@ PAGINAS_IMPLEMENTADAS = {
     "situacao_sigeduc": pagina_situacao_sigeduc,
     "comparacao_situacao": pagina_comparacao_situacao,
     "comparacao_serie": pagina_comparacao_serie,
+    "ajuste_tercos_eja": pagina_ajuste_tercos_eja,
+    "exclusao_movimentacao": pagina_exclusao_movimentacao,
+    "cadastro_proxima_matricula": pagina_cadastro_proxima_matricula,
+    "reconciliacao_eja": pagina_reconciliacao_eja,
 }
 
 with st.sidebar:
@@ -1600,7 +2188,7 @@ with st.sidebar:
     pagina = st.radio("Módulo", list(MODULOS_CORE.keys()), index=0)
     st.divider()
     st.caption(
-        "Os módulos A-I estão implementados em `src/core`. "
+        "Os módulos A-M estão implementados em `src/core`. "
         "Cada um valida as colunas que recebe e mostra um erro claro se "
         "alguma estiver faltando."
     )
